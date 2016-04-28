@@ -7,6 +7,7 @@
 //
 
 #import "AppDelegate.h"
+#import "MLSDownloader.h"
 
 @interface AppDelegate ()
 
@@ -17,6 +18,10 @@
 
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     // Override point for customization after application launch.
+
+        MLSDownloaderSingleton.autoResume = YES;
+        MLSDownloaderSingleton.allowBackgroundDownload = NO;
+        MLSDownloaderSingleton.onlyUseWifi = YES;
 
     return YES;
 }

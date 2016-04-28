@@ -8,7 +8,6 @@
 
 #ifndef PrefixHeader_pch
 #define PrefixHeader_pch
-#define NSLog(fmt, ...) NSLog((@"%s [Line %d] " fmt), __PRETTY_FUNCTION__, __LINE__, ##__VA_ARGS__)
-#define portNum 54321
+
 
 #endif /* PrefixHeader_pch */

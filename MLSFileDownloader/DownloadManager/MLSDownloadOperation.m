@@ -7,190 +7,389 @@
 //
 
 #import "MLSDownloadOperation.h"
-#import "NSString+MLSEncrypt.h"
-#import "MLSDownloaderM3u8Operation.h"
-#import "MLSDownloadNomarlOperation.h"
-dispatch_queue_t global_parser_queue(void) {
-    
-    static dispatch_queue_t mls_download_parser_queue;
-    static dispatch_once_t onceToken;
-    
-    dispatch_once(&onceToken, ^{
-        mls_download_parser_queue = dispatch_queue_create("com.mlsdownload.parser", DISPATCH_QUEUE_CONCURRENT );
-    });
-    
-    return mls_download_parser_queue;
-};
+#import "MLSDownloadFileTools.h"
+#import "MLSDownloaderCommon.h"
+#include <CommonCrypto/CommonCrypto.h>
+#include <zlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
 
-
-@interface MLSDownloadOperation() {
-    NSInteger tempCountNetworkSpeed;
+static inline NSString * MLSKeyPathFromOperationState(MLSDownloadState state)
+{
+        switch (state)
+        {
+                case MLSDownloadStateReady:
+                        return @"isReady";
+                case MLSDownloadStateExecuting:
+                        return @"isExecuting";
+                case MLSDownloadStateCompletion:
+                        return @"isFinished";
+                case MLSDownloadStatePaused:
+                        return @"isPaused";
+                default:
+                {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunreachable-code"
+                        return @"state";
+#pragma clang diagnostic pop
+                }
+        }
 }
+
+static inline BOOL MLSStateTransitionIsValid(MLSDownloadState fromState, MLSDownloadState toState, BOOL isCancelled)
+{
+        switch (fromState)
+        {
+                case MLSDownloadStateReady:
+                        switch (toState)
+                {
+                        case MLSDownloadStatePaused:
+                        case MLSDownloadStateExecuting:
+                                return YES;
+                        case MLSDownloadStateCompletion:
+                                return isCancelled;
+                        default:
+                                return NO;
+                }
+                case MLSDownloadStateExecuting:
+                        switch (toState)
+                {
+                        case MLSDownloadStatePaused:
+                        case MLSDownloadStateCompletion:
+                                return YES;
+                        default:
+                                return NO;
+                }
+                case MLSDownloadStateCompletion:
+                        return NO;
+                case MLSDownloadStatePaused:
+                        return toState == MLSDownloadStateReady;
+                default:
+                {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunreachable-code"
+                        switch (toState)
+                        {
+                                case MLSDownloadStatePaused:
+                                case MLSDownloadStateReady:
+                                case MLSDownloadStateExecuting:
+                                case MLSDownloadStateCompletion:
+                                        return YES;
+                                default:
+                                        return NO;
+                        }
+                }
+#pragma clang diagnostic pop
+        }
+}
+
+static NSString *md5String(const void *data, CC_LONG len)
+{
+        unsigned char result[CC_MD5_DIGEST_LENGTH];
+        CC_MD5(data, len, result);
+        NSMutableString *resString = [NSMutableString string];
+        for (int i = 0; i < CC_MD5_DIGEST_LENGTH; i++)
+        {
+                [resString appendFormat:@"%02x",result[i]];
+        }
+        return resString;
+}
+
+NSRecursiveLock *recursiveLock()
+{
+        static NSRecursiveLock *lock;
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+                lock = [[NSRecursiveLock alloc] init];
+                lock.name = @"mls.donwload.lock";
+        });
+        return lock;
+}
+
+@interface MLSDownloadOperation()
+
+// 完成回调
+@property (copy, nonatomic, readwrite) MLSDownloaderCompletionCallBackBlock completionCallBackBlock;
+
+// 下载进度回调
+@property (copy, nonatomic, readwrite) MLSDownloaderProgressCallBackBlock progressCallBackBlock;
+
+// 网速回调
+@property (copy, nonatomic, readwrite) DownloaderNetworkSpeedCompletionBlock networkSpeedCallBackBlock;
+
+
+// 下载队列
+@property (strong, nonatomic, readwrite) dispatch_queue_t download_queue;
+
+@property (strong, nonatomic) NSTimer *timer;
+
+
+@property (copy, nonatomic, readwrite) NSString *localFullPath;
+
+@property (copy, nonatomic, readwrite) NSString *fileType;
+
+@property (copy, nonatomic, readwrite) NSString *tempFileName;
+
+@property (copy, nonatomic, readwrite) NSString *saveFileName;
+
+@property (copy, nonatomic, readwrite) NSString *urlStr;
+
+@property (copy, nonatomic, readwrite) NSString *fileName;
+
+@property (copy, nonatomic, readwrite) NSString *filePath;
+
+@property (copy, nonatomic, readwrite) NSString *placeHolderImageUrl;
+
+@property (copy, nonatomic, readwrite) NSString *key;
+
 @end
+
 @implementation MLSDownloadOperation
 
 
-
 // 下载进度回调
-- (void)setProgressBlock:(MLSDownloaderProgressCallBackBlock)progress {
-    self.progressCallBackBlock = progress;
+- (void)setProgressBlock:(MLSDownloaderProgressCallBackBlock)progress
+{
+        self.progressCallBackBlock = progress;
 }
 // 完成回调
-- (void)setCompletionBlock:(MLSDownloaderCompletionCallBackBlock)completion {
-    self.completionCallBackBlock = completion;
+- (void)setCompletionBlock:(MLSDownloaderCompletionCallBackBlock)completion
+{
+        self.completionCallBackBlock = completion;
 }
 - (void)setNetworkSpeedBlock:(DownloaderNetworkSpeedCompletionBlock)networkSpeedBlock {
-    self.networkSpeedCallBackBlock = networkSpeedBlock;
+        self.networkSpeedCallBackBlock = networkSpeedBlock;
 }
-- (void)setCompletion:(BOOL)completion {
-    if (_completion != completion) {
-        _completion = completion;
-        if (completion == YES) {
-            self.suspend = !completion;
-            self.downloading = !completion;
+
+- (void)setState:(MLSDownloadState)state
+{
+        if (!MLSStateTransitionIsValid(self.state, state, [self isCancelled]))
+        {
+                return;
         }
-    }
+        [recursiveLock() lock];
+        NSString *oldStateKey = MLSKeyPathFromOperationState(self.state);
+        NSString *newStateKey = MLSKeyPathFromOperationState(state);
+
+        [self willChangeValueForKey:newStateKey];
+        [self willChangeValueForKey:oldStateKey];
+        _state = state;
+        [self didChangeValueForKey:oldStateKey];
+        [self didChangeValueForKey:newStateKey];
+        [recursiveLock() unlock];
 }
-- (void)setSuspend:(BOOL)suspend {
-    if (_suspend != suspend) {
-        _suspend = suspend;
-        if (suspend == YES) {
-            self.completion = !suspend;
-            self.downloading = !suspend;
-        }
+
+- (BOOL)changeUrlString:(NSString *)urlString
+{
+    if ([self isExecuting])
+    {
+        return NO;
     }
+    self.urlStr = urlString;
+    return YES;
 }
-- (void)setDownloading:(BOOL)downloading {
-    if (_downloading != downloading) {
-        _downloading = downloading;
-        if (downloading == YES) {
-            self.completion = !downloading;
-            self.suspend = !downloading;
-        }
-    }
-}
-- (NSString *)locaPlayUrlStr {
-    if (self.isCompletion) {
-        return _locaPlayUrlStr;
-    }
-    return nil;
-}
+
 // 初始化下载操作
 - (instancetype)initWithUrlStr:(NSString *)urlStr
                       fileName:(NSString *)fileName
                       fileSize:(CGFloat)fileSize
            fileDestinationPath:(NSString *)path
-                   placeHolder:(UIImage *)placeHolder
+                   placeHolder:(NSString *)placeHolder
                       progress:(MLSDownloaderProgressCallBackBlock)progressBlock
-                    completion:(MLSDownloaderCompletionCallBackBlock)completion {
-    
-    if (self = [super init]) {
-        
-        self.completionPercent = 0;
-        
-        self.timer = [NSTimer timerWithTimeInterval:1 target:self selector:@selector(countNetworkSpeed) userInfo:nil repeats:YES];
-        
-        [[NSRunLoop currentRunLoop] addTimer:self.timer forMode:NSRunLoopCommonModes];
-        
-        self.key = [urlStr md5String];
-        self.urlStr = urlStr;
-        self.fileSize = fileSize;
-        self.fileName = fileName;
-        self.filePath = path;
-        self.placeHolderImage = placeHolder;
-        self.progressCallBackBlock = progressBlock;
-        self.completionCallBackBlock = completion;
-        self.name = fileName;
-    }
-    return self;
-}
+                    completion:(MLSDownloaderCompletionCallBackBlock)completion
+{
 
-// 地址失效时，更改地址
-- (instancetype)changeDownloadUrlString:(NSString *)urlString {
-    return nil;
-}
+        if (self = [super init])
+        {
+                NSAssert((urlStr != nil && fileName != nil && path != nil), @"url  filename  path 不能为空");
 
-// 恢复指定下载操作
-- (instancetype)resume {
-    return nil;
-}
-- (void)cancelCurrentDownload {
-    
-    self.suspend = YES;
-    
-    [self cancel];
-}
-- (void)countNetworkSpeed {
-    
-    if (self.networkSpeedCallBackBlock != nil) {
-        
-        // 计算网速
-//        NSLog(@"%@",self.countNetworkArr);
-        if (self.countNetworkArr.count >= _NETWORK_SPPED_COUNT_) {
-            
-            [self.countNetworkArr enumerateObjectsUsingBlock:^(NSNumber * _Nonnull obj, NSUInteger idx, BOOL * _Nonnull stop) {
-                
-                tempCountNetworkSpeed += obj.integerValue;
-                
-            }];
-            
-            tempCountNetworkSpeed = tempCountNetworkSpeed * 1.0 / self.countNetworkArr.count;
-            // 移除之前的权重
-            
-            for (int i = 0; i < self.countNetworkArr.count - _NETWORK_SPPED_COUNT_ ; i++) {
-                [self.countNetworkArr removeObjectAtIndex:i];
-            }
+                [self prepare];
+                self.canAutoResume = NO;
+                self.state = MLSDownloadStateReady;
+                self.urlStr = urlStr;
+                self.fileName = fileName;
+                self.filePath = path;
+                self.fileSize = fileSize;
+
+                self.placeHolderImageUrl = placeHolder;
+
+
+                self.fileType = [MLSDownloadFileTools fileFormatForUrlString:urlStr];
+                self.fileType == nil ? self.fileType = @"mp4" : self.fileType;
+                self.tempFileName = [NSString stringWithFormat:@"%@%@.tmp",self.fileName,self.fileType];
+                self.localFullPath = [path stringByAppendingPathComponent:fileName];
+                self.saveFileName = [NSString stringWithFormat:@"%@%@",self.fileName,self.fileType];
+
+
+                NSString *key = [NSString stringWithFormat:@"%@",fileName];
+                NSData *keyData = [key dataUsingEncoding:NSUTF8StringEncoding];
+                self.key = md5String(keyData.bytes, (CC_LONG)keyData.length);
+
+                self.progressCallBackBlock = progressBlock;
+                self.completionCallBackBlock = completion;
+
+                NSError *error = nil;
+                NSFileManager *fileManager = [NSFileManager defaultManager];
+                BOOL dir = NO;
+
+                if (![fileManager fileExistsAtPath:self.localFullPath isDirectory:&dir])
+                {
+
+                        if (dir == NO)
+                        {
+
+                                [[NSFileManager defaultManager] createDirectoryAtPath:self.localFullPath withIntermediateDirectories:YES attributes:nil error:&error];
+
+                                if (error != nil)
+                                {
+                                        [self cancel];
+
+                                        dispatch_async(dispatch_get_main_queue(), ^{
+                                                if (self.completionCallBackBlock != nil)
+                                                {
+                                                        self.completionCallBackBlock(self,nil,error);
+                                                }
+                                        });
+                                        NSLog(@"create directory error %@",error);
+
+                                }
+                        }
+                }
+
+
         }
-        
-        
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (tempCountNetworkSpeed == 0) {
-                tempCountNetworkSpeed = _DEFAULT_NETWORK_SPEED;
-            }
-            self.networkSpeedCallBackBlock(tempCountNetworkSpeed);
-        });
-        
-        // 临时计算属性清零
-        tempCountNetworkSpeed = 0;
-    }
+        return self;
 }
+
+- (void)prepare
+{
+        if ([self.timer isValid])
+        {
+                [self.timer invalidate];
+                self.timer = nil;
+        }
+        // 计算网速
+        self.timer = [NSTimer timerWithTimeInterval:1.0 target:self selector:@selector(countNetworkSpeed) userInfo:nil repeats:YES];
+        [self.timer fire];
+        [[NSRunLoop currentRunLoop] addTimer:self.timer forMode:NSRunLoopCommonModes];
+}
+- (void)countNetworkSpeed{};
+
+- (NSString *)filePath
+{
+        if (_filePath == nil)
+        {
+                return [MLSDownloadFileTools saveFilePath];
+        }
+        return _filePath;
+}
+
+- (BOOL)isReady
+{
+        return (self.state == MLSDownloadStateReady || self.isWaiting) && [super isReady];
+}
+
+- (BOOL)isExecuting
+{
+        return self.state == MLSDownloadStateExecuting || self.isDownloading;
+}
+
+- (BOOL)isFinished
+{
+        return self.state == MLSDownloadStateCompletion || self.state == MLSDownloadStatePaused || self.isCancelled;
+}
+- (BOOL)isCompletion
+{
+    return self.state == MLSDownloadStateCompletion || self.completion;
+}
+
+- (BOOL)isConcurrent
+{
+        return YES;
+}
+- (void)cancel
+{
+        if ([self.timer isValid])
+        {
+                [self.timer invalidate];
+                self.timer = nil;
+        }
+        [super cancel];
+}
+- (BOOL)isPaused
+{
+        return self.state == MLSDownloadStatePaused || self.isSuspend;
+}
+// 恢复指定下载操作
+- (instancetype)resume
+{
+        [recursiveLock() lock];
+
+        MLSDownloadOperation *operation = self.copy;
+        operation.state = MLSDownloadStateReady;
+        [operation prepare];
+
+        [recursiveLock() unlock];
+
+        return operation;
+}
+// 暂停
+- (void)paused
+{
+        [recursiveLock() lock];
+
+        if ([self.timer isValid])
+        {
+                [self.timer invalidate];
+                self.timer = nil;
+        }
+
+        self.state = MLSDownloadStatePaused;
+        [self cancel];
+
+        [recursiveLock() unlock];
+}
+
+
 
 // 删除本地文件
-- (BOOL)deleteFile {
-    
-    NSFileManager *fileManager = [NSFileManager defaultManager];
-    BOOL result = NO;
-    
-    if ([self isKindOfClass:[MLSDownloaderM3u8Operation class]]) {
-        
+- (BOOL)deleteFile
+{
+
+        NSFileManager *fileManager = [NSFileManager defaultManager];
+        BOOL result = NO;
+
         NSError *error = nil;
-        [fileManager removeItemAtPath:[self.filePath stringByAppendingPathComponent:self.fileName] error:&error];
-        
-        if (error == nil) {
-            result = YES;
-        }else {
-            result = NO;
+        [fileManager removeItemAtPath:self.localFullPath error:&error];
+
+        if (error == nil)
+        {
+                result = YES;
         }
-    }else if ([self isKindOfClass:[MLSDownloadNomarlOperation class]]){
-        NSError *error = nil;
-        
-        MLSDownloadNomarlOperation *operation = (MLSDownloadNomarlOperation *)self;
-        
-        [fileManager removeItemAtPath:[operation.filePath stringByAppendingString:operation.suggestedFilename] error:&error];
-        
-        if (error == nil) {
-            result = YES;
-        }else {
-            result = NO;
+        else
+        {
+                result = NO;
         }
-    }
-    return result;
+
+        NSLog(@"%@---error%@",self.filePath,error);
+
+        return result;
 }
-- (NSMutableArray<NSNumber *> *)countNetworkArr {
-    if (_countNetworkArr == nil) {
-        _countNetworkArr = [[NSMutableArray alloc] initWithCapacity:_NETWORK_SPPED_COUNT_];
-    }
-    return _countNetworkArr;
+
+- (void)changeFileRootPathWithPath:(NSString *)path
+{
+        self.filePath = path;
+        self.localFullPath = [path stringByAppendingPathComponent:self.fileName];
+}
+
+- (void)dealloc
+{
+        if (self.timer != nil && [self.timer isValid])
+        {
+                [self.timer invalidate];
+                self.timer = nil;
+        }
 }
 
 //===========================================================
@@ -199,50 +398,101 @@ dispatch_queue_t global_parser_queue(void) {
 //===========================================================
 - (void)encodeWithCoder:(NSCoder *)encoder
 {
-    [encoder encodeObject:self.video_id forKey:@"video_id"];
-    [encoder encodeObject:self.cate_id forKey:@"cate_id"];
-    [encoder encodeObject:self.video_type forKey:@"video_type"];
-    [encoder encodeObject:self.key forKey:@"key"];
-    [encoder encodeFloat:self.fileSize forKey:@"fileSize"];
-    [encoder encodeObject:self.urlStr forKey:@"urlStr"];
-    [encoder encodeObject:self.fileName forKey:@"fileName"];
-    [encoder encodeObject:self.filePath forKey:@"filePath"];
-    [encoder encodeObject:self.placeHolderImage forKey:@"placeHolderImage"];
-    [encoder encodeObject:self.placeHolderImageUrl forKey:@"placeHolderImageUrl"];
-    [encoder encodeBool:self.completion forKey:@"completion"];
-    [encoder encodeBool:self.suspend forKey:@"suspend"];
-    [encoder encodeBool:self.downloading forKey:@"downloading"];
-    [encoder encodeFloat:self.completionPercent forKey:@"completionPercent"];
-    [encoder encodeObject:self.locaPlayUrlStr forKey:@"locaPlayUrlStr"];
-    [encoder encodeInteger:self.totalSeconds forKey:@"totalSeconds"];
-    [encoder encodeObject:self.countNetworkArr forKey:@"countNetworkArr"];
-//    [encoder encodeObject:self.resumeData forKey:@"resumeData"];
+
+        @synchronized (self)
+        {
+
+                [encoder encodeObject:[self customData] forKey:@"customData"];
+                [encoder encodeObject:[self localFullPath] forKey:@"localFullPath"];
+                [encoder encodeObject:[self fileType] forKey:@"fileType"];
+
+                [encoder encodeObject:[self urlStr] forKey:@"urlStr"];
+                [encoder encodeObject:[self fileName] forKey:@"fileName"];
+                [encoder encodeObject:[self filePath] forKey:@"filePath"];
+                [encoder encodeObject:[self placeHolderImageUrl] forKey:@"placeHolderImageUrl"];
+
+                [encoder encodeObject:[NSNumber numberWithUnsignedInteger:self.state] forKey:@"state"];
+
+                [encoder encodeDouble:self.fileSize forKey:@"fileSize"];
+                [encoder encodeObject:[self key] forKey:@"key"];
+                [encoder encodeFloat:[self completionPercent] forKey:@"completionPercent"];
+                [encoder encodeObject:[self tempFileName] forKey:@"tempFileName"];
+                [encoder encodeObject:[self saveFileName] forKey:@"saveFileName"];
+                [encoder encodeBool:self.isCanAutoResume forKey:@"canAutoResume"];
+
+        }
 }
 
 - (id)initWithCoder:(NSCoder *)decoder
 {
-    self = [super init];
-    if (self) {
-        self.video_id = [decoder decodeObjectForKey:@"video_id"];
-        self.cate_id = [decoder decodeObjectForKey:@"cate_id"];
-        self.video_type = [decoder decodeObjectForKey:@"video_type"];
-        self.key = [decoder decodeObjectForKey:@"key"];
-        self.fileSize = [decoder decodeFloatForKey:@"fileSize"];
-        self.urlStr = [decoder decodeObjectForKey:@"urlStr"];
-        self.fileName = [decoder decodeObjectForKey:@"fileName"];
-        self.filePath = [decoder decodeObjectForKey:@"filePath"];
-        self.placeHolderImage = [decoder decodeObjectForKey:@"placeHolderImage"];
-        self.placeHolderImageUrl = [decoder decodeObjectForKey:@"placeHolderImageUrl"];
-        self.completion = [decoder decodeBoolForKey:@"completion"];
-        self.suspend = [decoder decodeBoolForKey:@"suspend"];
-        self.downloading = [decoder decodeBoolForKey:@"downloading"];
-        self.completionPercent = [decoder decodeFloatForKey:@"completionPercent"];
-        self.locaPlayUrlStr = [decoder decodeObjectForKey:@"locaPlayUrlStr"];
-        self.totalSeconds = [decoder decodeIntegerForKey:@"totalSeconds"];
-        self.countNetworkArr = [decoder decodeObjectForKey:@"countNetworkArr"];
-//        self.resumeData = [decoder decodeObjectForKey:@"resumeData"];
-    }
-    return self;
+        self = [super init];
+        if (self) {
+
+                @synchronized (self)
+                {
+                        [self setCustomData:[decoder decodeObjectForKey:@"customData"]];
+                        [self setLocalFullPath:[decoder decodeObjectForKey:@"localFullPath"]];
+                        [self setFileType:[decoder decodeObjectForKey:@"fileType"]];
+
+                        [self setUrlStr:[decoder decodeObjectForKey:@"urlStr"]];
+                        [self setFileName:[decoder decodeObjectForKey:@"fileName"]];
+                        [self setFilePath:[decoder decodeObjectForKey:@"filePath"]];
+                        [self setPlaceHolderImageUrl:[decoder decodeObjectForKey:@"placeHolderImageUrl"]];
+                        [self setState:(MLSDownloadState)[[decoder decodeObjectForKey:@"state"] unsignedIntegerValue]];
+
+                        self.fileSize = [decoder decodeDoubleForKey:@"fileSize"];
+                        [self setKey:[decoder decodeObjectForKey:@"key"]];
+                        self.completionPercent = [decoder decodeFloatForKey:@"completionPercent"];
+                        [self setTempFileName:[decoder decodeObjectForKey:@"tempFileName"]];
+                        [self setSaveFileName:[decoder decodeObjectForKey:@"saveFileName"]];
+
+                        self.canAutoResume = [decoder decodeBoolForKey:@"canAutoResume"];
+
+#pragma mark - 兼容上个版本
+                        self.completion = [decoder decodeBoolForKey:@"completion"];
+                        self.suspend = [decoder decodeBoolForKey:@"suspend"];
+                        self.downloading = [decoder decodeBoolForKey:@"downloading"];
+                        self.waiting = [decoder decodeBoolForKey:@"waiting"];
+                }
+
+        }
+        return self;
+}
+- (id)copyWithZone:(NSZone *)zone
+{
+        MLSDownloadOperation * theCopy = nil;
+
+        NSData *data = [NSKeyedArchiver archivedDataWithRootObject:self];
+
+        if (data)
+        {
+                theCopy = [NSKeyedUnarchiver unarchiveObjectWithData:data];
+                theCopy.localFullPath = self.localFullPath;
+                theCopy.filePath = self.filePath;
+                theCopy.progressCallBackBlock = self.progressCallBackBlock;
+                theCopy.completionCallBackBlock = self.completionCallBackBlock;
+                theCopy.networkSpeedCallBackBlock = self.networkSpeedCallBackBlock;
+        }
+        
+        return theCopy;
+}
+- (id)mutableCopyWithZone:(NSZone *)zone
+{
+        MLSDownloadOperation * theCopy = nil;
+
+        NSData *data = [NSKeyedArchiver archivedDataWithRootObject:self];
+
+        if (data)
+        {
+                theCopy = [NSKeyedUnarchiver unarchiveObjectWithData:data];
+                theCopy.localFullPath = self.localFullPath;
+                theCopy.filePath = self.filePath;
+                theCopy.progressCallBackBlock = self.progressCallBackBlock;
+                theCopy.completionCallBackBlock = self.completionCallBackBlock;
+                theCopy.networkSpeedCallBackBlock = self.networkSpeedCallBackBlock;
+        }
+
+        return theCopy;
 }
 @end
 
@@ -251,3 +501,14 @@ NSString *waitingArrayLocalStr = @"waiting.data";
 NSString *tmpM3u8TextLoacalStr = @"movie.m3u8.tmp";
 NSString *realM3u8TextLocalStr = @"movie.m3u8";
 NSString *errorDomain = @"com.mlsdownloader.errordomain";
+
+long GetLocalFileLenth(FILE *fp)
+{
+
+        if(fp != NULL)
+        {
+                fseek(fp, 0, SEEK_END);
+                return ftell(fp);
+        }
+        return 0;
+}

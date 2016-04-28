@@ -9,9 +9,6 @@
 #import "MLSDownloadOperation.h"
 
 @interface MLSDownloadNomarlOperation : MLSDownloadOperation
-@property (copy, nonatomic, readonly) NSString *fullPath;
-@property (strong, nonatomic, readonly) NSURLSessionDownloadTask *currentDownloadTask;
-@property (copy, nonatomic, readonly) NSString *fileType;
-@property (copy, nonatomic, readonly) NSString *suggestedFilename;
-@property (copy, nonatomic, readonly) NSString *tempFileName;
+
+
 @end

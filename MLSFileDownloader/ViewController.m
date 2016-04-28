@@ -9,7 +9,6 @@
 #import "ViewController.h"
 
 #import <AVFoundation/AVFoundation.h>
-#import "MLSDownloaderSessionManager.h"
 #import "MLSDownloader.h"
 static NSInteger count = 0;
 @interface ViewController ()
@@ -39,7 +38,8 @@ static NSInteger count = 0;
     NSString *urlString = @"http://36.250.240.84/ws.cdn.baidupcs.com/file/089794a032f1858aa9bca7df81598396?bkt=p3-0000089794a032f1858aa9bca7df81598396&xcode=a4917c9df03a1c1d012b0c79b9d345bea8623322c24b7d09a271ffda32bcb45b&fid=3692544880-250528-852050494772481&time=1452837645&sign=FDTAXGERLBH-DCb740ccc5511e5e8fedcff06b081203-vRKUwqjDfWQD%2FG6wmgIEACUQGkE%3D&to=cb&fm=Nan,B,U,nc&sta_dx=682&sta_cs=3&sta_ft=mp4&sta_ct=5&fm2=Nanjing02,B,U,nc&newver=1&newfm=1&secfm=1&flow_ver=3&pkey=0000089794a032f1858aa9bca7df81598396&sl=72286286&expires=8h&rt=pr&r=475781649&mlogid=338240852178807312&vuk=3692544880&vbdid=1362062792&fin=Lesbian%20Jacuzzi%20-%20Onix%20Babe%20%26%20Eris%20Maximo.mp4&slt=pm&uta=0&rtype=1&iv=0&isw=0&dp-logid=338240852178807312&dp-callid=0.1.1&wshc_tag=0&wsts_tag=56988b0d&wsid_tag=76c2f6bb&wsiphost=ipdbm";
     
     
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 5; i++)
+    {
         urlString = [urlString stringByReplacingPercentEscapesUsingEncoding:NSUTF8StringEncoding];
         NSLog(@"%@",[urlString stringByAddingPercentEscapesUsingEncoding:NSUTF8StringEncoding]);
     }
@@ -70,28 +70,24 @@ static NSInteger count = 0;
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 //    urlString = [urlString stringByAddingPercentEscapesUsingEncoding:NSUTF8StringEncoding];
 #pragma clang diagnostic pop
-    
-    self.operation =  [self.downloader startDownloadWithUrlStr:urlString fileName:[NSString stringWithFormat:@"%ld",count] fileSize:1000 placeHolderImage:nil fileDestinationPath:self.filePath progress:^(NSURLSession *session, NSURLSessionDownloadTask *downloadTask, CGFloat progress, MLSDownloadOperation *operation) {
-        
-//        NSLog(@"%f",progress);
-    } completion:^(NSURLResponse *response, NSURL *filePath, NSError *error, MLSDownloadOperation *operation) {
-        
-        NSLog(@"%@",error);
+
+    self.operation = [MLSDownloaderSingleton startDownloadWithUrlStr:urlString fileName:[NSString stringWithFormat:@"%ld",count] fileSize:1000 customPara:nil placeHolderImageUrl:nil fileDestinationPath:self.filePath progress:^(MLSDownloadOperation *operation, CGFloat progress) {
+                    NSLog(@"%f",progress);
+    } completion:^(MLSDownloadOperation *operation, NSURL *filePath, NSError *error) {
+             NSLog(@"%@",error);
     }];
 
     
-//    [[[MLSDownloaderSessionManager shareDownloadManager] addDownloadTaskWithUrlString:@"http://7xj71p.com2.z0.glb.qiniucdn.com/kxko1qHbwFq7aF4GLe5f0lNbzMw=/ll7Qf34j_1MMJkKg8rZEkYOgqj1f/000000.ts" destination:[self.filePath stringByAppendingPathComponent:@"01.ts"] downloadProgress:^(NSURLSession *session, NSURLSessionDownloadTask *downloadTask, int64_t bytesWritten, int64_t totalBytesWritten, int64_t totalBytesExpectedToWrite) {
-//        NSLog(@"%lld",bytesWritten);
-//    } completionHandler:^(NSURLResponse *response, NSURL *filePath, NSError *error) {
-//        NSLog(@"%@",filePath);
-//    }] resume];
-    
-    
 }
 - (IBAction)cancel:(id)sender {
-    
+        [MLSDownloaderSingleton pauseDownloadWithKey:self.operation.key completion:^(MLSDownloadOperation *operation, NSError *error) {
+                self.operation = operation;
+        }];
 }
-- (IBAction)resume:(id)sender {
-    
+- (IBAction)resume:(id)sender
+{
+        [MLSDownloaderSingleton resumeDownloadWithKey:self.operation.key completion:^(MLSDownloadOperation *operation, NSError *error) {
+                self.operation = operation;
+        }];
 }
 @end

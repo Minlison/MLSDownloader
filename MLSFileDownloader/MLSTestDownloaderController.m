@@ -18,12 +18,6 @@
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    
-    NSLog(@"%@",[MLSDownloader shareDownloader].downloadingArray);
-    NSLog(@"%@",[MLSDownloader shareDownloader].downloadQueue.operations);
-    [[MLSDownloader shareDownloader].downloadQueue.operations enumerateObjectsUsingBlock:^(__kindof NSOperation * _Nonnull obj, NSUInteger idx, BOOL * _Nonnull stop) {
-        NSLog(@"\n%@ ----- isCancelled %d \n isExecuting %d \n isFinished  %d \n isReady  %d \n isConcurrent  %d  \n isAsynchronous%d\n",obj.name,obj.isCancelled,obj.isExecuting,obj.isFinished,obj.isReady,obj.isConcurrent,obj.isAsynchronous);
-    }];
 }
 
 - (void)didReceiveMemoryWarning {
@@ -43,7 +37,8 @@
 }
 
 
-- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath
+{
     MLSTestCell *cell = [tableView dequeueReusableCellWithIdentifier:@"reuseIdentifier" forIndexPath:indexPath];
     cell.operation = [MLSDownloader shareDownloader].downloadingArray[indexPath.row];
     // Configure the cell...

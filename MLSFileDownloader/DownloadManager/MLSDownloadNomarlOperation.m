@@ -7,373 +7,582 @@
 //
 
 #import "MLSDownloadNomarlOperation.h"
-#import "MLSDownloaderSessionManager.h"
-@interface MLSDownloadNomarlOperation() <NSXMLParserDelegate> {
-    BOOL barraryLock;
-    NSInteger tempCountNetworkSpeed;
-    BOOL fileInfoDataReady;
-}
-@property (copy, nonatomic, readwrite) NSString *fullPath;
-@property (strong, nonatomic, readwrite) NSURLSessionDownloadTask *currentDownloadTask;
-@property (copy, nonatomic, readwrite) NSString *fileType;
-@property (copy, nonatomic, readwrite) NSString *suggestedFilename;
-@property (copy, nonatomic, readwrite) NSString *tempFileName;
-@property (strong, nonatomic) NSXMLParser *xmlParser;
+#import "MLSDownloadFileTools.h"
+#import "MLSDownloaderCommon.h"
+
+/**
+ *  下载回调函数
+ *
+ *  @param ptr             自定义参数
+ *  @param totalToDownload 总共需要下载量
+ *  @param nowDownloaded   已经下载量
+ *  @param totalToUpLoad   总共需要上传量
+ *  @param nowUpLoaded     已经上传量
+ *
+ *  @return 是否成功
+ */
+int normalDownloadProgressFunc(void *ptr, double totalToDownload, double nowDownloaded, double totalToUpLoad, double nowUpLoaded);
+/**
+ *  下载写入本地函数
+ *
+ *  @param downloadData 下载的数据
+ *  @param size         大小
+ *  @param count        个数
+ *  @param userdata     自定义参数
+ *
+ *  @return 写入本地的数据量
+ */
+size_t normalDownLoadPackageFunc(char *downloadData, size_t size, size_t count, void* userdata);
+
+
+@interface MLSDownloadNomarlOperation()
+/**
+ *  C文件指针
+ */
+@property ( assign, nonatomic ) FILE * fp;
+
+/**
+ *  本地文件大小
+ */
+@property ( assign, nonatomic ) long localLength;
+
+
+/**
+ *  已经下载的文件长度
+ */
+@property ( assign, nonatomic) int64_t downloadLength;
+
+
+@property (assign, nonatomic) int tempCountNetworkSpeed;
+
+// 判断是cancel还是libcurl错误
+@property (assign, nonatomic,getter=isCurlError) BOOL curlError;
+/**
+ *  获取需要下载的文件大小
+ */
+- (double)getDownloadSize;
+// 检查本地文件夹，找出已经下载过的文件
+- (void)checkLocalDownloadState;
+// 准备curl
+- (BOOL)prepareForCurl;
+// 使用curl下载
+- (BOOL)downloadUseCurl;
+
 @end
 
 @implementation MLSDownloadNomarlOperation
-- (instancetype)initWithUrlStr:(NSString *)urlStr
-                      fileName:(NSString *)fileName
-                      fileSize:(CGFloat)fileSize
-           fileDestinationPath:(NSString *)path
-                   placeHolder:(UIImage *)placeHolder
-                      progress:(MLSDownloaderProgressCallBackBlock)progressBlock
-                    completion:(MLSDownloaderCompletionCallBackBlock)completion {
-    
-    if (self = [super initWithUrlStr:urlStr fileName:fileName fileSize:fileSize fileDestinationPath:path placeHolder:placeHolder progress:progressBlock completion:completion]) {
-        
-        self.locaPlayUrlStr = nil;
-        fileInfoDataReady = NO;
-        self.downloading = YES;
-        barraryLock = NO;
-        tempCountNetworkSpeed = _DEFAULT_NETWORK_SPEED;
-        
-        self.fullPath = [path stringByAppendingPathComponent:fileName];
-        
-        NSError *error = nil;
-        NSFileManager *fileManager = [NSFileManager defaultManager];
-        BOOL dir = NO;
-        
-        if (![fileManager fileExistsAtPath:path isDirectory:&dir]) {
-            
-            if (dir == NO) {
-                
-                [[NSFileManager defaultManager] createDirectoryAtPath:self.fullPath withIntermediateDirectories:YES attributes:nil error:&error];
-                
-                if (error != nil) {
-                    
-                    [self cancel];
-                    
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        if (self.completionCallBackBlock != nil) {
-                            self.completionCallBackBlock(nil,[NSURL URLWithString:path],error,nil);
+
+
+
+- (void)main
+{
+        @autoreleasepool
+        {
+                self.curlError = NO;
+                [self checkLocalDownloadState];
+
+                if (!self.isCancelled && self.state != MLSDownloadStateCompletion)
+                {
+                        [recursiveLock() lock];
+                        self.state = MLSDownloadStateExecuting;
+                        [recursiveLock() unlock];
+
+
+                        if (![self checkNetworkFileIsExit])
+                        {
+                                [recursiveLock() lock];
+                                self.state = MLSDownloadStatePaused;
+                                [self cancel];
+                                [recursiveLock() unlock];
                         }
-                    });
-                    NSLog(@"create directory error %@",error);
-                    
-                }
-            }
-        }
-    }
-    
-    return self;
-}
-
-- (instancetype)changeDownloadUrlString:(NSString *)urlString {
-    
-    MLSDownloadNomarlOperation *newOperation = [[MLSDownloadNomarlOperation alloc] initWithUrlStr:urlString fileName:self.fileName fileSize:self.fileSize fileDestinationPath:self.filePath placeHolder:self.placeHolderImage progress:self.progressCallBackBlock completion:self.completionCallBackBlock];
-    
-    newOperation.completionPercent = self.completionPercent;
-    newOperation.tempFileName = self.tempFileName;
-    newOperation.countNetworkArr = self.countNetworkArr;
-    newOperation.placeHolderImageUrl = self.placeHolderImageUrl;
-    newOperation.placeHolderImage = self.placeHolderImage;
-    return newOperation;
-}
-
-- (instancetype)resume {
-    
-    return [self changeDownloadUrlString:self.urlStr];
-}
-
-
-
-- (void)main {
-    @autoreleasepool {
-        
-        // 获取文件信息
-        [self getFileInfoWithUrl:self.urlStr];
-        
-        while (!fileInfoDataReady) {
-            
-            if (self.isCancelled) {
-                return;
-            }else {
-                continue;
-            }
-        }
-        
-       
-        if (self.isCancelled) {
-            return;
-        }
-        
-        // 检查本地文件
-        [self checkLocalDownloadState];
-        
-        if (self.isCancelled) {
-            return;
-        }
-        
-        // 开始下载
-        [self startDownload];
-    }
-}
-- (void)cancelCurrentDownload {
-    
-    if (self.currentDownloadTask != nil) {
-        
-        [self.currentDownloadTask cancelByProducingResumeData:^(NSData * _Nullable resumeData) {
-            // 保存恢复数据
-            [resumeData writeToFile:[self.fullPath stringByAppendingPathComponent:[NSString stringWithFormat:@"%@_%@",self.fileName,resumeDataLocalStr]] atomically:YES];
-            
-            dispatch_async(global_parser_queue(), ^{
-                
-                self.xmlParser = [[NSXMLParser alloc] initWithData:resumeData];
-                self.xmlParser.delegate = self;
-                [self.xmlParser parse];
-                
-            });
-            
-        }];
-    }
-    [super cancelCurrentDownload];
-}
-
-- (void)parser:(NSXMLParser *)parser foundCharacters:(NSString *)string {
-    
-    //记录所取得的文字列
-    if ([string rangeOfString:@".tmp"].location != NSNotFound) {
-        
-        NSString *tempFilePath = [NSTemporaryDirectory() stringByAppendingPathComponent:string];
-        NSError *error = nil;
-        
-        self.tempFileName = string;
-        
-        [[NSFileManager defaultManager] moveItemAtPath:tempFilePath toPath:[self.fullPath stringByAppendingPathComponent:string] error:&error];
-        [parser abortParsing];
-    }
-}
-
-// 根据url获取文件信息
-- (void)getFileInfoWithUrl:(NSString *)urlString {
-    
-    if (urlString == nil) {
-        
-        [self cancelCurrentDownload];
-        
-        fileInfoDataReady = NO;
-    }else {
-        
-        NSMutableURLRequest *requestM = [[NSMutableURLRequest alloc] initWithURL:[NSURL URLWithString:urlString] cachePolicy:NSURLRequestReloadIgnoringCacheData timeoutInterval:10.0];
-        requestM.HTTPMethod = @"HEAD";
-        
-        [[[MLSDownloaderSessionManager shareDownloadManager] dataTaskWithRequest:requestM completionHandler:^(NSURLResponse * _Nonnull response, id  _Nullable responseObject, NSError * _Nullable error) {
-            
-            if (error == nil) {
-                
-                fileInfoDataReady = YES;
-                
-                self.suggestedFilename = response.suggestedFilename;
-                
-                self.fullPath = [self.filePath stringByAppendingPathComponent:self.suggestedFilename];
-                
-                NSString *fileFullName = response.suggestedFilename;
-                NSRange typeRange = [fileFullName rangeOfString:@"." options:NSBackwardsSearch];
-                
-                self.fileType = [fileFullName substringFromIndex:typeRange.location + typeRange.length];
-                
-                if (self.fileName == nil) {
-                    
-                    if (typeRange.location != NSNotFound) {
-                        self.fileName = [fileFullName substringToIndex:typeRange.location];
-                    }
-                }
-                if (self.fileSize == 0) {
-                    self.fileSize = response.expectedContentLength <= 0 ? 0 : response.expectedContentLength;
-                }
-                
-            }else {
-                
-                fileInfoDataReady = NO;
-                [self cancelCurrentDownload];
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    
-                    if (self.completionCallBackBlock != nil) {
-                        if (self.filePath) {
-                            
-                            self.completionCallBackBlock(response,[NSURL URLWithString:self.filePath],error,self);
-                        }else {
-                            self.completionCallBackBlock(response,nil,error,self);
+                        else if ( [self prepareForCurl] )
+                        {
+                                if (self.state == MLSDownloadStateExecuting)
+                                {
+                                        [self downloadUseCurl];
+                                }
                         }
-                    }
-                });
-                
-            }
-        }] resume];
-    }
+
+
+                }
+
+        }
+}
+
+
+// 计算网速 --> 子类实现
+- (void)countNetworkSpeed
+{
+        NSLog(@"%@计算网速",self.fileName);
+        dispatch_async(dispatch_get_main_queue(), ^{
+
+                if (self.networkSpeedCallBackBlock != nil)
+                {
+
+                        if (self.tempCountNetworkSpeed != 0 && self.networkSpeedCallBackBlock != nil)
+                        {
+                                self.networkSpeedCallBackBlock(self.downloadLength - self.tempCountNetworkSpeed);
+                        }
+
+                        // 临时计算属性清零
+                        self.tempCountNetworkSpeed = (int)self.downloadLength;
+                }
+        });
+}
+
+
+
+- (NSString *)locaPlayUrlStr
+{
+        if (self.state == MLSDownloadStateCompletion )
+        {
+                NSString *url = nil;
+
+
+                NSError *error = nil;
+
+                NSArray <NSString *>*array = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:self.localFullPath error:&error];
+
+                if (error != nil || array == nil || array.count == 0 )
+                {
+                        return nil;
+                }
+                else
+                {
+                        url = [[NSString stringWithFormat:@"file://%@/%@",self.localFullPath,self.saveFileName] stringByAddingPercentEscapesUsingEncoding:NSUTF8StringEncoding];
+                }
+                return url;
+        }
+        return nil;
 }
 
 // 检查本地文件夹，找出已经下载过的文件
-- (void)checkLocalDownloadState {
-    
-    NSFileManager *fileManager = [NSFileManager defaultManager];
-    BOOL dir = NO;
-    if ([fileManager fileExistsAtPath:[self.fullPath stringByAppendingPathComponent:self.tempFileName] isDirectory:&dir]) {
-        
-        if (dir == NO) {
-            
-            [fileManager moveItemAtPath:[self.fullPath stringByAppendingPathComponent:self.tempFileName] toPath:[NSTemporaryDirectory() stringByAppendingPathComponent:self.tempFileName] error:NULL];
+- (void)checkLocalDownloadState
+{
+        NSFileManager *fileManager = [NSFileManager defaultManager];
+        NSString *fileSavePath = [self.localFullPath stringByAppendingPathComponent:self.saveFileName];
 
-            
-            if ([fileManager fileExistsAtPath:[self.fullPath stringByAppendingPathComponent:[NSString stringWithFormat:@"%@_%@",self.fileName,resumeDataLocalStr]]] ) {
-                
-                NSString *filePath = [self.fullPath stringByAppendingPathComponent:[NSString stringWithFormat:@"%@_%@",self.fileName,resumeDataLocalStr]];
-//                NSLog(@"%@",filePath);
-                self.resumeData = [NSData dataWithContentsOfFile:filePath];
-                
-                [fileManager removeItemAtPath:[self.fullPath stringByAppendingPathComponent:[NSString stringWithFormat:@"%@_%@",self.fileName,resumeDataLocalStr]] error:NULL];
-            }
-        }
-    }
-}
-- (void)startDownload {
-    
-    __weak typeof (self) weakSelf = self;
-    
-    barraryLock = YES;
-    
-    void (^progressBlock)(NSURLSession *session, NSURLSessionDownloadTask *downloadTask, int64_t bytesWritten, int64_t totalBytesWritten, int64_t totalBytesExpectedToWrite)  = ^(NSURLSession *session, NSURLSessionDownloadTask *downloadTask, int64_t bytesWritten, int64_t totalBytesWritten, int64_t totalBytesExpectedToWrite)  {
-        
-        __strong typeof (weakSelf) strongSelf = weakSelf;
-        
-        [self.countNetworkArr addObject:@(bytesWritten * 8)];
-        
-        CGFloat percent = totalBytesWritten * 1.0 / totalBytesExpectedToWrite;
-        
-        self.completionPercent = percent;
-        
-        dispatch_async(dispatch_get_main_queue(), ^{
-            
-            if (strongSelf.progressCallBackBlock != nil) {
-                strongSelf.progressCallBackBlock(session,downloadTask,percent,self);
-            }
-            
-        });
-        
-        // 如果在下载过程中取消操作，就取消操作
-        if (strongSelf.isCancelled) {
-            // 取消循环等待锁
-            barraryLock = NO;
-        }
-    };
-    
-    void (^completionBlock)(NSURLResponse *response, NSURL *filePath, NSError *error)  = ^(NSURLResponse *response, NSURL *filePath, NSError *error) {
-        
-        __strong typeof (weakSelf) strongSelf = weakSelf;
-        
-        barraryLock = NO;
-        
-        if (error != nil ) {
-            
-            self.suspend = YES;
-            dispatch_async(dispatch_get_main_queue(), ^{
-                
-                if (strongSelf.completionCallBackBlock != nil && ![error.localizedDescription isEqualToString:@"canceled"]) {
-                    
-                    strongSelf.completionCallBackBlock(response,filePath,nil,self);
-                    
-                }else if (strongSelf.completionCallBackBlock != nil) {
-                    
-                    strongSelf.completionCallBackBlock(response,filePath,error,self);
+        BOOL isDir = NO;
+        if ([fileManager fileExistsAtPath:fileSavePath isDirectory:&isDir])
+        {
+                if (!isDir)
+                {
+                        [recursiveLock() lock];
+                        [self cancel];
+                        self.state = MLSDownloadStateCompletion;
+                        self.completionPercent = 1.0;
+                        [recursiveLock() unlock];
+
+                        dispatch_async(dispatch_get_main_queue(), ^{
+
+                                if (self.completionCallBackBlock != nil)
+                                {
+                                        self.completionCallBackBlock(self,[NSURL URLWithString:[fileSavePath stringByAddingPercentEscapesUsingEncoding:NSUTF8StringEncoding]] ,nil);
+                                        return ;
+                                }
+                        });
                 }
-            });
-            
-            
-            NSLog(@"%@---download error %@",strongSelf.fileName, error);
-        }else {
-            self.completion = YES;
-            
-            dispatch_async(dispatch_get_main_queue(), ^{
-                
-                if (self.completionCallBackBlock != nil) {
-                    
-                    self.completionCallBackBlock(response,filePath,nil,self);
+        }
+        else
+        {
+                [fileManager removeItemAtPath:fileSavePath error:NULL];
+        }
+
+}
+// 准备curl
+- (BOOL)prepareForCurl
+{
+        // Create a file to save package.
+        char tempPah[1024] = {0};
+
+        const char *cSavePath = [self.localFullPath cStringUsingEncoding:NSUTF8StringEncoding];
+        const char *tempFileName = [self.tempFileName cStringUsingEncoding:NSUTF8StringEncoding];
+
+        sprintf(tempPah, "%s/%s",cSavePath,tempFileName);
+
+        //================断点续载===================
+
+        FILE *fp = NULL;
+        fp = fopen(tempPah, "a+b");
+        self.fp = fp;
+
+        if (fp == NULL)
+        {
+                self.state = MLSDownloadStatePaused;
+                return NO;
+        }
+
+        long localLen = GetLocalFileLenth(fp);
+        self.localLength = localLen;
+
+        [self getDownloadSize];
+
+        if (localLen == self.fileSize)
+        {
+                char savePath[1024] = {0};
+
+                sprintf(savePath, "%s/%s",cSavePath,[self.saveFileName cStringUsingEncoding:NSUTF8StringEncoding]);
+                rename(tempPah, savePath);
+                [recursiveLock() lock];
+                [self cancel];
+                self.state = MLSDownloadStateCompletion;
+                [recursiveLock() unlock];
+
+                dispatch_async(dispatch_get_main_queue(), ^{
+                        if (self.completionCallBackBlock != nil)
+                        {
+                                self.completionCallBackBlock(self,[NSURL URLWithString:self.filePath],nil);
+                        }
+                });
+                return NO;
+        }
+
+        return YES;
+
+}
+// 使用curl下载
+- (BOOL)downloadUseCurl
+{
+        const char *packageUrl = [self.urlStr cStringUsingEncoding:NSUTF8StringEncoding];
+
+        // Create a file to save package.
+        char tempPah[1024] = {0};
+
+        const char *cSavePath = [self.localFullPath cStringUsingEncoding:NSUTF8StringEncoding];
+        const char *tempFileName = [self.tempFileName cStringUsingEncoding:NSUTF8StringEncoding];
+        sprintf(tempPah, "%s/%s",cSavePath,tempFileName);
+
+        [[UIApplication sharedApplication] setNetworkActivityIndicatorVisible:YES];
+        // Download pacakge
+        CURLcode res;
+        CURL *curl = curl_easy_init();
+
+        curl_easy_setopt(curl, CURLOPT_URL, packageUrl);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &normalDownLoadPackageFunc);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, self);
+
+        curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+        curl_easy_setopt(curl, CURLOPT_PROGRESSFUNCTION, &normalDownloadProgressFunc);
+        curl_easy_setopt(curl, CURLOPT_PROGRESSDATA, self);
+
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
+        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 5L);
+
+        curl_easy_setopt(curl, CURLOPT_HEADER, 0L);
+        curl_easy_setopt(curl, CURLOPT_NOBODY, 0L);
+
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(curl, CURLOPT_RESUME_FROM, self.localLength);
+
+        // 不打断线程等待
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+
+
+
+        curl_easy_setopt(curl, CURLOPT_USERAGENT,"User-Agent:Mozilla/5.0 (Macintosh; U; Intel Mac OS X 10_6_8; en-us) AppleWebKit/534.50 (KHTML, like Gecko) Version/5.1 Safari/534.50");
+
+        res = curl_easy_perform(curl);
+
+        curl_easy_cleanup(curl);
+
+        // CURLE_WRITE_ERROR  // 调用pause方法取消下载
+        // CURLE_OK  正常下载完
+        // CURLE_COULDNT_CONNECT  无网络连接
+        // CURLE_OPERATION_TIMEDOUT  正在下载中，断掉网络
+        // CURLE_RANGE_ERROR  传入的range不对
+
+        if ( self.fp != NULL )
+        {
+                fclose(self.fp);
+                self.fp = NULL;
+        }
+
+        curl = NULL;
+
+        [[UIApplication sharedApplication] setNetworkActivityIndicatorVisible:NO];
+
+        if (res == CURLE_OK)
+        {
+                char savePath[1024] = {0};
+
+                sprintf(savePath, "%s/%s",cSavePath,[self.saveFileName cStringUsingEncoding:NSUTF8StringEncoding]);
+
+                [recursiveLock() lock];
+                rename(tempPah, savePath);
+                [self cancel];
+                self.state = MLSDownloadStateCompletion;
+                [recursiveLock() unlock];
+
+                dispatch_async(dispatch_get_main_queue(), ^{
+                        if (self.completionCallBackBlock != nil)
+                        {
+                                self.completionCallBackBlock(self,[NSURL URLWithString:self.filePath],nil);
+                        }
+                });
+
+                return YES;
+        }
+        else
+        {
+                [recursiveLock() lock];
+                self.state = MLSDownloadStatePaused;
+                [recursiveLock() unlock];
+
+                NSString *errorReson = [NSString stringWithFormat:@"error Code CURLcode = %d",res];
+                NSInteger errorCode = res;
+
+                if (self.isCancelled || !self.isCurlError)
+                {
+                        errorReson = @"已取消";
+                        errorCode = DownloadOperationErrorCodeCancel;
                 }
-            });
-            NSLog(@"%@---download success",strongSelf.fileName);
+                else if (res == CURLE_WRITE_ERROR)
+                {
+                        errorCode = DownloadOperationErrorCodeCacheError;
+                        errorReson = @"空间不足";
+                }
+
+                NSError *error = [NSError errorWithDomain:errorDomain code:errorCode userInfo:@{NSLocalizedDescriptionKey : errorReson}];
+
+
+
+                dispatch_async(dispatch_get_main_queue(), ^{
+                        if (self.completionCallBackBlock != nil)
+                        {
+                                self.completionCallBackBlock(self,nil,error);
+                        }
+                });
+                return NO;
         }
-    };
 
-    
-    
-    NSURLSessionDownloadTask *downloadTask = nil;
-    
-    if (self.resumeData != nil) {
-        
-         downloadTask = [[MLSDownloaderSessionManager shareDownloadManager] addDownloadTaskWithResumeData:self.resumeData destination:[self.fullPath stringByAppendingPathComponent:self.suggestedFilename] downloadProgress:progressBlock completionHandler:completionBlock];
-        [downloadTask resume];
-        self.currentDownloadTask = downloadTask;
-        
-    }else {
-        
-        downloadTask = [[MLSDownloaderSessionManager shareDownloadManager] addDownloadTaskWithUrlString:self.urlStr destination:[self.fullPath stringByAppendingPathComponent:self.suggestedFilename] downloadProgress:progressBlock completionHandler:completionBlock];
-        [downloadTask resume];
-    }
-    
-    self.currentDownloadTask = downloadTask;
-    
-    while (barraryLock == YES) {
-        continue;
-    }
 }
-
-- (NSString *)locaPlayUrlStr {
-    
-    if (self.isCompletion) {
-
-        NSError *error = nil;
-        
-        
-        NSArray <NSString *>*array = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:self.fullPath error:&error];
-        
-        if (error != nil || array == nil || array.count == 0 ) {
-            
-            return nil;
-            
-        }else {
-            
-            return [NSString stringWithFormat:@"file://%@/%@",self.fullPath,array.lastObject];
+- (double)getDownloadSize
+{
+        if (self.urlStr == nil)
+        {
+                return 0;
         }
-    }
-    return nil;
+
+        const char *url = [self.urlStr cStringUsingEncoding:NSUTF8StringEncoding];
+
+        CURL* curl;
+        CURLcode res;
+        double size = 0.0;
+
+        curl = curl_easy_init();
+        curl_easy_setopt(curl, CURLOPT_URL, url);
+        curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
+        curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, convenient_func);
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+        // 不打断线程sleep
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(curl, CURLOPT_USERAGENT,"User-Agent:Mozilla/5.0 (Macintosh; U; Intel Mac OS X 10_6_8; en-us) AppleWebKit/534.50 (KHTML, like Gecko) Version/5.1 Safari/534.50");
+
+        res = curl_easy_perform(curl);
+
+        [recursiveLock() lock];
+
+        res = curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD, &size);
+
+        [recursiveLock() unlock];
+
+        curl_easy_cleanup(curl);
+
+        if ( self.fileSize <= size && size > 0 )
+        {
+                self.fileSize = size;
+        }
+
+        if(res != CURLE_OK)
+        {
+                fprintf(stderr, "curl_easy_getinfo() failed: %s\n", curl_easy_strerror(res));
+                NSLog(@"curl_easy_getinfo() error");
+                return 0;
+        }
+
+
+
+        return size;
 }
+- (BOOL)checkNetworkFileIsExit
+{
+        if (self.urlStr == nil)
+        {
+                return NO;
+        }
+
+        const char *url = [self.urlStr cStringUsingEncoding:NSUTF8StringEncoding];
+
+        CURL* curl;
+        CURLcode res;
+        int responseCode = 0;
+
+        curl = curl_easy_init();
+        curl_easy_setopt(curl, CURLOPT_URL, url);
+        curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
+        curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, convenient_func);
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+        // 不打断线程sleep
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(curl, CURLOPT_USERAGENT,"User-Agent:Mozilla/5.0 (Macintosh; U; Intel Mac OS X 10_6_8; en-us) AppleWebKit/534.50 (KHTML, like Gecko) Version/5.1 Safari/534.50");
+
+        res = curl_easy_perform(curl);
+
+        [recursiveLock() lock];
+
+        res = curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &responseCode);
+
+        [recursiveLock() unlock];
+
+        curl_easy_cleanup(curl);
+
+        if( res != CURLE_OK )
+        {
+                fprintf(stderr, "checkNetworkFileIsExit failed: %s\n", curl_easy_strerror(res));
+                NSLog(@"checkNetworkFileIsExit error");
+        }
+
+        // 说明文件不存在
+        if ( responseCode >= 400 || res!= CURLE_OK )
+        {
 
 
+                [recursiveLock() lock];
+                [self cancel];
+                self.state = MLSDownloadStatePaused;
+                [recursiveLock() unlock];
 
-//===========================================================
-//  Keyed Archiving
-//
-//===========================================================
+                NSString *errorReson = @"网络文件不存在";
+
+                NSError *error = [NSError errorWithDomain:errorDomain code:DownloadOperationErrorCodeFileIsNotExit userInfo:@{NSLocalizedDescriptionKey : errorReson}];
+
+                dispatch_async(dispatch_get_main_queue(), ^{
+                        if (self.completionCallBackBlock != nil)
+                        {
+                                self.completionCallBackBlock(self,nil,error);
+                        }
+                });
+
+                return NO;
+        }
+
+        return YES;
+}
+- (instancetype)initWithCoder:(NSCoder *)aDecoder
+{
+        if (self = [super initWithCoder:aDecoder])
+        {
+                self.downloadLength = [aDecoder decodeInt64ForKey:@"downloadLength"];
+        }
+        return self;
+}
 - (void)encodeWithCoder:(NSCoder *)encoder
 {
-    [super encodeWithCoder:encoder];
-    [encoder encodeObject:self.fullPath forKey:@"fullPath"];
-    [encoder encodeObject:self.fileType forKey:@"fileType"];
-    [encoder encodeObject:self.suggestedFilename forKey:@"suggestedFilename"];
-    [encoder encodeObject:self.tempFileName forKey:@"tempFileName"];
+        [super encodeWithCoder:encoder];
+        [encoder encodeInt64:self.downloadLength forKey:@"downloadLength"];
 }
-
-- (id)initWithCoder:(NSCoder *)decoder
+- (id)copyWithZone:(NSZone *)zone
 {
-    self = [super initWithCoder:decoder];
-    if (self) {
-        self.fullPath = [decoder decodeObjectForKey:@"fullPath"];
-        self.fileType = [decoder decodeObjectForKey:@"fileType"];
-        self.suggestedFilename = [decoder decodeObjectForKey:@"suggestedFilename"];
-        self.tempFileName = [decoder decodeObjectForKey:@"tempFileName"];
-    }
-    return self;
+        MLSDownloadNomarlOperation * theCopy = nil;
+
+        NSData *data = [NSKeyedArchiver archivedDataWithRootObject:self];
+
+        if (data)
+        {
+                theCopy = [NSKeyedUnarchiver unarchiveObjectWithData:data];
+                theCopy.downloadLength = self.downloadLength;
+        }
+
+        return theCopy;
+}
+- (id)mutableCopyWithZone:(NSZone *)zone
+{
+        MLSDownloadNomarlOperation * theCopy = nil;
+
+        NSData *data = [NSKeyedArchiver archivedDataWithRootObject:self];
+
+        if (data)
+        {
+                theCopy = [NSKeyedUnarchiver unarchiveObjectWithData:data];
+                theCopy.downloadLength = self.downloadLength;
+        }
+
+        return theCopy;
+}
+@end
+// ===================C method =====================
+
+int normalDownloadProgressFunc(void *ptr, double totalToDownload, double nowDownloaded, double totalToUpLoad, double nowUpLoaded)
+{
+        if ( ![[UIApplication sharedApplication] isNetworkActivityIndicatorVisible])
+        {
+                 [[UIApplication sharedApplication] setNetworkActivityIndicatorVisible:YES];
+        }
+        if (totalToDownload == 0 || nowDownloaded == 0 || totalToDownload / nowDownloaded == 1)
+        {
+                return 0;
+        }
+
+        //    static int percent = 0;
+        MLSDownloadNomarlOperation *operation = (__bridge MLSDownloadNomarlOperation *)ptr;
+
+        float tmp = 0;
+        long localLen = (long)operation.localLength;
+
+
+        [recursiveLock() lock];
+        operation.downloadLength = nowDownloaded + localLen;
+        [recursiveLock() unlock];
+
+        if ( totalToDownload > 0 )
+        {
+                tmp = (float)((nowDownloaded + (double)localLen) / (totalToDownload + (double)localLen));
+                if (tmp == 0)
+                {
+                        tmp = operation.completionPercent;
+                }
+        }
+        operation.completionPercent = tmp;
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+
+                if ( operation.progressCallBackBlock != nil )
+                {
+                        operation.progressCallBackBlock(operation,tmp);
+                }
+        });
+        
+        return 0;
 }
 
-@end
+size_t normalDownLoadPackageFunc(char *downloadData, size_t size, size_t count, void* userdata)
+{
+        [recursiveLock() lock];
+        
+        MLSDownloadNomarlOperation *operation = (__bridge MLSDownloadNomarlOperation *)userdata;
+        
+        if (!operation.fp)
+        {
+                operation.state = MLSDownloadStatePaused;
+                operation.curlError = NO;
+                return 0;
+        }
+
+        size_t writeData = fwrite( downloadData, size , count, operation.fp );
+        
+        
+        
+        if (operation.isCancelled || operation.state != MLSDownloadStateExecuting)
+        {
+                [recursiveLock() unlock];
+                operation.curlError = NO;
+                return 0;
+        }
+        operation.curlError = (writeData != size * count);
+        [recursiveLock() unlock];
+
+
+        return writeData;
+}
+
