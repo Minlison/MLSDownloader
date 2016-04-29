@@ -36,6 +36,11 @@ size_t normalDownLoadPackageFunc(char *downloadData, size_t size, size_t count, 
 
 
 @interface MLSDownloadNomarlOperation()
+
+/**
+ *  下载库，curl
+ */
+@property (assign, atomic) CURL *downloadCurl;
 /**
  *  C文件指针
  */
@@ -57,6 +62,7 @@ size_t normalDownLoadPackageFunc(char *downloadData, size_t size, size_t count, 
 
 // 判断是cancel还是libcurl错误
 @property (assign, nonatomic,getter=isCurlError) BOOL curlError;
+
 /**
  *  获取需要下载的文件大小
  */
@@ -68,11 +74,12 @@ size_t normalDownLoadPackageFunc(char *downloadData, size_t size, size_t count, 
 // 使用curl下载
 - (BOOL)downloadUseCurl;
 
+
 @end
 
+
+
 @implementation MLSDownloadNomarlOperation
-
-
 
 - (void)main
 {
@@ -103,6 +110,7 @@ size_t normalDownLoadPackageFunc(char *downloadData, size_t size, size_t count, 
                                 }
                         }
 
+                        NSLog(@"  completion  ");
 
                 }
 
@@ -110,25 +118,6 @@ size_t normalDownLoadPackageFunc(char *downloadData, size_t size, size_t count, 
 }
 
 
-// 计算网速 --> 子类实现
-- (void)countNetworkSpeed
-{
-        NSLog(@"%@计算网速",self.fileName);
-        dispatch_async(dispatch_get_main_queue(), ^{
-
-                if (self.networkSpeedCallBackBlock != nil)
-                {
-
-                        if (self.tempCountNetworkSpeed != 0 && self.networkSpeedCallBackBlock != nil)
-                        {
-                                self.networkSpeedCallBackBlock(self.downloadLength - self.tempCountNetworkSpeed);
-                        }
-
-                        // 临时计算属性清零
-                        self.tempCountNetworkSpeed = (int)self.downloadLength;
-                }
-        });
-}
 
 
 
@@ -215,7 +204,10 @@ size_t normalDownLoadPackageFunc(char *downloadData, size_t size, size_t count, 
         long localLen = GetLocalFileLenth(fp);
         self.localLength = localLen;
 
-        [self getDownloadSize];
+        if ([self getDownloadSize] == 0)
+        {
+                return NO;
+        }
 
         if (localLen == self.fileSize)
         {
@@ -257,6 +249,8 @@ size_t normalDownLoadPackageFunc(char *downloadData, size_t size, size_t count, 
         CURLcode res;
         CURL *curl = curl_easy_init();
 
+
+
         curl_easy_setopt(curl, CURLOPT_URL, packageUrl);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &normalDownLoadPackageFunc);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, self);
@@ -282,9 +276,45 @@ size_t normalDownLoadPackageFunc(char *downloadData, size_t size, size_t count, 
 
         curl_easy_setopt(curl, CURLOPT_USERAGENT,"User-Agent:Mozilla/5.0 (Macintosh; U; Intel Mac OS X 10_6_8; en-us) AppleWebKit/534.50 (KHTML, like Gecko) Version/5.1 Safari/534.50");
 
-        res = curl_easy_perform(curl);
+        [recursiveLock() lock];
+        self.downloadCurl = curl;
+        [recursiveLock() unlock];
 
-        curl_easy_cleanup(curl);
+
+        if (self.isCancelled)
+        {
+                [recursiveLock() lock];
+
+                if (self.downloadCurl)
+                {
+                        curl_easy_cleanup(self.downloadCurl);
+                        self.downloadCurl = NULL;
+                        curl = NULL;
+                }
+
+                [recursiveLock() unlock];
+
+                return NO;
+        }
+
+
+        if ( self.downloadCurl && self.state == MLSDownloadStateExecuting && !self.isCancelled)
+        {
+                res = curl_easy_perform(curl);
+        }
+
+
+        [recursiveLock() lock];
+
+        if (self.downloadCurl)
+        {
+                curl_easy_cleanup(self.downloadCurl);
+                self.downloadCurl = NULL;
+                curl = NULL;
+        }
+
+        [recursiveLock() unlock];
+
 
         // CURLE_WRITE_ERROR  // 调用pause方法取消下载
         // CURLE_OK  正常下载完
@@ -298,7 +328,7 @@ size_t normalDownLoadPackageFunc(char *downloadData, size_t size, size_t count, 
                 self.fp = NULL;
         }
 
-        curl = NULL;
+
 
         [[UIApplication sharedApplication] setNetworkActivityIndicatorVisible:NO];
 
@@ -332,7 +362,7 @@ size_t normalDownLoadPackageFunc(char *downloadData, size_t size, size_t count, 
                 NSString *errorReson = [NSString stringWithFormat:@"error Code CURLcode = %d",res];
                 NSInteger errorCode = res;
 
-                if (self.isCancelled || !self.isCurlError)
+                if ( self.isCancelled || !self.isCurlError )
                 {
                         errorReson = @"已取消";
                         errorCode = DownloadOperationErrorCodeCancel;
@@ -359,7 +389,7 @@ size_t normalDownLoadPackageFunc(char *downloadData, size_t size, size_t count, 
 }
 - (double)getDownloadSize
 {
-        if (self.urlStr == nil)
+        if (self.urlStr == nil || self.isCancelled)
         {
                 return 0;
         }
@@ -367,8 +397,9 @@ size_t normalDownLoadPackageFunc(char *downloadData, size_t size, size_t count, 
         const char *url = [self.urlStr cStringUsingEncoding:NSUTF8StringEncoding];
 
         CURL* curl;
-        CURLcode res;
+        CURLcode res = CURL_LAST;
         double size = 0.0;
+
 
         curl = curl_easy_init();
         curl_easy_setopt(curl, CURLOPT_URL, url);
@@ -379,29 +410,48 @@ size_t normalDownLoadPackageFunc(char *downloadData, size_t size, size_t count, 
         curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
         curl_easy_setopt(curl, CURLOPT_USERAGENT,"User-Agent:Mozilla/5.0 (Macintosh; U; Intel Mac OS X 10_6_8; en-us) AppleWebKit/534.50 (KHTML, like Gecko) Version/5.1 Safari/534.50");
 
-        res = curl_easy_perform(curl);
+        [recursiveLock() lock];
+        self.downloadCurl = curl;
+        [recursiveLock() unlock];
+
+        if (self.downloadCurl && !self.isCancelled && !self.isPaused)
+        {
+                res = curl_easy_perform(curl);
+        }
 
         [recursiveLock() lock];
 
-        res = curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD, &size);
-
+        if (self.downloadCurl)
+        {
+                res = curl_easy_getinfo(self.downloadCurl, CURLINFO_CONTENT_LENGTH_DOWNLOAD, &size);
+        }
         [recursiveLock() unlock];
 
-        curl_easy_cleanup(curl);
+        [recursiveLock() lock];
+        if (self.downloadCurl)
+        {
+                curl_easy_cleanup(self.downloadCurl);
+                self.downloadCurl = NULL;
+        }
+        [recursiveLock() unlock];
+
+        curl = NULL;
+
+        if (self.isCancelled)
+        {
+                return 0;
+        }
 
         if ( self.fileSize <= size && size > 0 )
         {
                 self.fileSize = size;
         }
-
         if(res != CURLE_OK)
         {
                 fprintf(stderr, "curl_easy_getinfo() failed: %s\n", curl_easy_strerror(res));
                 NSLog(@"curl_easy_getinfo() error");
                 return 0;
         }
-
-
 
         return size;
 }
@@ -414,9 +464,12 @@ size_t normalDownLoadPackageFunc(char *downloadData, size_t size, size_t count, 
 
         const char *url = [self.urlStr cStringUsingEncoding:NSUTF8StringEncoding];
 
+
+
         CURL* curl;
-        CURLcode res;
+        CURLcode res = CURL_LAST;
         int responseCode = 0;
+
 
         curl = curl_easy_init();
         curl_easy_setopt(curl, CURLOPT_URL, url);
@@ -427,32 +480,53 @@ size_t normalDownLoadPackageFunc(char *downloadData, size_t size, size_t count, 
         curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
         curl_easy_setopt(curl, CURLOPT_USERAGENT,"User-Agent:Mozilla/5.0 (Macintosh; U; Intel Mac OS X 10_6_8; en-us) AppleWebKit/534.50 (KHTML, like Gecko) Version/5.1 Safari/534.50");
 
-        res = curl_easy_perform(curl);
+        if (self.isCancelled)
+        {
+                [recursiveLock() lock];
+                curl_easy_cleanup(curl);
+                [recursiveLock() unlock];
+
+                return NO;
+        }
 
         [recursiveLock() lock];
-
-        res = curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &responseCode);
-
+        self.downloadCurl = curl;
         [recursiveLock() unlock];
 
-        curl_easy_cleanup(curl);
 
-        if( res != CURLE_OK )
+        if (self.downloadCurl && !self.isCancelled && !self.isPaused)
         {
-                fprintf(stderr, "checkNetworkFileIsExit failed: %s\n", curl_easy_strerror(res));
-                NSLog(@"checkNetworkFileIsExit error");
+                res = curl_easy_perform(curl);
+        }
+
+
+
+        [recursiveLock() lock];
+        if (self.downloadCurl)
+        {
+                res = curl_easy_getinfo(self.downloadCurl, CURLINFO_RESPONSE_CODE, &responseCode);
+        }
+        [recursiveLock() unlock];
+
+
+
+        [recursiveLock() lock];
+        if (self.downloadCurl)
+        {
+                curl_easy_cleanup(self.downloadCurl);
+                self.downloadCurl = NULL;
+        }
+        [recursiveLock() unlock];
+
+
+        if (self.isCancelled)
+        {
+                return NO;
         }
 
         // 说明文件不存在
         if ( responseCode >= 400 || res!= CURLE_OK )
         {
-
-
-                [recursiveLock() lock];
-                [self cancel];
-                self.state = MLSDownloadStatePaused;
-                [recursiveLock() unlock];
-
                 NSString *errorReson = @"网络文件不存在";
 
                 NSError *error = [NSError errorWithDomain:errorDomain code:DownloadOperationErrorCodeFileIsNotExit userInfo:@{NSLocalizedDescriptionKey : errorReson}];
@@ -469,31 +543,10 @@ size_t normalDownLoadPackageFunc(char *downloadData, size_t size, size_t count, 
 
         return YES;
 }
-- (instancetype)initWithCoder:(NSCoder *)aDecoder
-{
-        if (self = [super initWithCoder:aDecoder])
-        {
-                self.downloadLength = [aDecoder decodeInt64ForKey:@"downloadLength"];
-        }
-        return self;
-}
-- (void)encodeWithCoder:(NSCoder *)encoder
-{
-        [super encodeWithCoder:encoder];
-        [encoder encodeInt64:self.downloadLength forKey:@"downloadLength"];
-}
+
 - (id)copyWithZone:(NSZone *)zone
 {
-        MLSDownloadNomarlOperation * theCopy = nil;
-
-        NSData *data = [NSKeyedArchiver archivedDataWithRootObject:self];
-
-        if (data)
-        {
-                theCopy = [NSKeyedUnarchiver unarchiveObjectWithData:data];
-                theCopy.downloadLength = self.downloadLength;
-        }
-
+        MLSDownloadNomarlOperation * theCopy = [[[self class] allocWithZone:zone] initWithUrlStr:self.urlStr fileName:self.fileName fileSize:self.fileSize fileDestinationPath:self.filePath placeHolder:self.placeHolderImageUrl progress:self.progressCallBackBlock completion:self.completionCallBackBlock];
         return theCopy;
 }
 - (id)mutableCopyWithZone:(NSZone *)zone
@@ -505,7 +558,9 @@ size_t normalDownLoadPackageFunc(char *downloadData, size_t size, size_t count, 
         if (data)
         {
                 theCopy = [NSKeyedUnarchiver unarchiveObjectWithData:data];
-                theCopy.downloadLength = self.downloadLength;
+                [theCopy setCompletionBlock:self.completionCallBackBlock];
+                [theCopy setProgressBlock:self.progressCallBackBlock];
+                [theCopy setNetworkSpeedBlock:self.networkSpeedCallBackBlock];
         }
 
         return theCopy;
@@ -515,13 +570,14 @@ size_t normalDownLoadPackageFunc(char *downloadData, size_t size, size_t count, 
 
 int normalDownloadProgressFunc(void *ptr, double totalToDownload, double nowDownloaded, double totalToUpLoad, double nowUpLoaded)
 {
-        if ( ![[UIApplication sharedApplication] isNetworkActivityIndicatorVisible])
-        {
-                 [[UIApplication sharedApplication] setNetworkActivityIndicatorVisible:YES];
-        }
         if (totalToDownload == 0 || nowDownloaded == 0 || totalToDownload / nowDownloaded == 1)
         {
                 return 0;
+        }
+
+        if (![[UIApplication sharedApplication] isNetworkActivityIndicatorVisible])
+        {
+                [[UIApplication sharedApplication] setNetworkActivityIndicatorVisible:YES];
         }
 
         //    static int percent = 0;
@@ -545,8 +601,20 @@ int normalDownloadProgressFunc(void *ptr, double totalToDownload, double nowDown
         }
         operation.completionPercent = tmp;
 
-        dispatch_async(dispatch_get_main_queue(), ^{
+        double speed = 0;
+        if (curl_easy_getinfo(operation.downloadCurl, CURLINFO_SPEED_DOWNLOAD,&speed) == CURLE_OK)
+        {
+                if ( operation.networkSpeedCallBackBlock != nil )
+                {
+                        operation.networkSpeedCallBackBlock(speed);
+                }
+        }
 
+
+
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+                
                 if ( operation.progressCallBackBlock != nil )
                 {
                         operation.progressCallBackBlock(operation,tmp);
@@ -568,7 +636,7 @@ size_t normalDownLoadPackageFunc(char *downloadData, size_t size, size_t count, 
                 operation.curlError = NO;
                 return 0;
         }
-
+        
         size_t writeData = fwrite( downloadData, size , count, operation.fp );
         
         
@@ -581,8 +649,8 @@ size_t normalDownLoadPackageFunc(char *downloadData, size_t size, size_t count, 
         }
         operation.curlError = (writeData != size * count);
         [recursiveLock() unlock];
-
-
+        
+        
         return writeData;
 }
 

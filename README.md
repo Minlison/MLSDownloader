@@ -1,22 +1,10 @@
 # MLSDownloader
-###m3u8下载和普通文件下载集成为一个下载器，使用block回调方法
-!目前版本V1.0.0功能
+###m3u8下载和普通文件下载集成为一个下载器
+#####修改功能V1.0.2版本
 
-修改功能1.0.2版本
-1.添加m3u8文件播放server
-2.全部使用libCurl下载
+·1.添加m3u8文件播放HttpServer
 
-##在启动方法中执行下面代码
+·2.全部使用libCurl下载
 
--(BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions 
+#####修复快速点击恢复时崩溃
 
-{
-        
-        MLSDownloaderSingleton.autoResume = YES;
-        MLSDownloaderSingleton.allowBackgroundDownload = NO;
-        MLSDownloaderSingleton.onlyUseWifi = YES;
-        
-        
-	return YES;
-	
-}

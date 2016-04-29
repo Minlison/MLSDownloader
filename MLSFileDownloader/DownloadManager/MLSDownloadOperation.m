@@ -119,11 +119,6 @@ NSRecursiveLock *recursiveLock()
 @property (copy, nonatomic, readwrite) DownloaderNetworkSpeedCompletionBlock networkSpeedCallBackBlock;
 
 
-// 下载队列
-@property (strong, nonatomic, readwrite) dispatch_queue_t download_queue;
-
-@property (strong, nonatomic) NSTimer *timer;
-
 
 @property (copy, nonatomic, readwrite) NSString *localFullPath;
 
@@ -203,8 +198,7 @@ NSRecursiveLock *recursiveLock()
         if (self = [super init])
         {
                 NSAssert((urlStr != nil && fileName != nil && path != nil), @"url  filename  path 不能为空");
-
-                [self prepare];
+                
                 self.canAutoResume = NO;
                 self.state = MLSDownloadStateReady;
                 self.urlStr = urlStr;
@@ -243,6 +237,7 @@ NSRecursiveLock *recursiveLock()
 
                                 if (error != nil)
                                 {
+                                        self.state = MLSDownloadStatePaused;
                                         [self cancel];
 
                                         dispatch_async(dispatch_get_main_queue(), ^{
@@ -262,19 +257,7 @@ NSRecursiveLock *recursiveLock()
         return self;
 }
 
-- (void)prepare
-{
-        if ([self.timer isValid])
-        {
-                [self.timer invalidate];
-                self.timer = nil;
-        }
-        // 计算网速
-        self.timer = [NSTimer timerWithTimeInterval:1.0 target:self selector:@selector(countNetworkSpeed) userInfo:nil repeats:YES];
-        [self.timer fire];
-        [[NSRunLoop currentRunLoop] addTimer:self.timer forMode:NSRunLoopCommonModes];
-}
-- (void)countNetworkSpeed{};
+
 
 - (NSString *)filePath
 {
@@ -287,48 +270,46 @@ NSRecursiveLock *recursiveLock()
 
 - (BOOL)isReady
 {
-        return (self.state == MLSDownloadStateReady || self.isWaiting) && [super isReady];
+        return self.state == MLSDownloadStateReady && [super isReady];
 }
 
 - (BOOL)isExecuting
 {
-        return self.state == MLSDownloadStateExecuting || self.isDownloading;
+        return self.state == MLSDownloadStateExecuting;
 }
 
 - (BOOL)isFinished
 {
-        return self.state == MLSDownloadStateCompletion || self.state == MLSDownloadStatePaused || self.isCancelled;
+        return self.state == MLSDownloadStateCompletion || self.state == MLSDownloadStatePaused;
 }
 - (BOOL)isCompletion
 {
-    return self.state == MLSDownloadStateCompletion || self.completion;
+    return self.state == MLSDownloadStateCompletion;
 }
 
 - (BOOL)isConcurrent
 {
         return YES;
 }
-- (void)cancel
-{
-        if ([self.timer isValid])
-        {
-                [self.timer invalidate];
-                self.timer = nil;
-        }
-        [super cancel];
-}
+
 - (BOOL)isPaused
 {
-        return self.state == MLSDownloadStatePaused || self.isSuspend;
+        return self.state == MLSDownloadStatePaused;
 }
 // 恢复指定下载操作
 - (instancetype)resume
 {
         [recursiveLock() lock];
 
+        if (self.state == MLSDownloadStateExecuting)
+        {
+                [self cancel];
+        }
+
+
+
         MLSDownloadOperation *operation = self.copy;
         operation.state = MLSDownloadStateReady;
-        [operation prepare];
 
         [recursiveLock() unlock];
 
@@ -337,15 +318,15 @@ NSRecursiveLock *recursiveLock()
 // 暂停
 - (void)paused
 {
-        [recursiveLock() lock];
-
-        if ([self.timer isValid])
+        if (self.isPaused)
         {
-                [self.timer invalidate];
-                self.timer = nil;
+                return;
         }
 
+        [recursiveLock() lock];
+
         self.state = MLSDownloadStatePaused;
+
         [self cancel];
 
         [recursiveLock() unlock];
@@ -383,14 +364,6 @@ NSRecursiveLock *recursiveLock()
         self.localFullPath = [path stringByAppendingPathComponent:self.fileName];
 }
 
-- (void)dealloc
-{
-        if (self.timer != nil && [self.timer isValid])
-        {
-                [self.timer invalidate];
-                self.timer = nil;
-        }
-}
 
 //===========================================================
 //  Keyed Archiving
@@ -402,7 +375,7 @@ NSRecursiveLock *recursiveLock()
         @synchronized (self)
         {
 
-                [encoder encodeObject:[self customData] forKey:@"customData"];
+                [encoder encodeObject:[self customParaData] forKey:@"customParaData"];
                 [encoder encodeObject:[self localFullPath] forKey:@"localFullPath"];
                 [encoder encodeObject:[self fileType] forKey:@"fileType"];
 
@@ -411,7 +384,14 @@ NSRecursiveLock *recursiveLock()
                 [encoder encodeObject:[self filePath] forKey:@"filePath"];
                 [encoder encodeObject:[self placeHolderImageUrl] forKey:@"placeHolderImageUrl"];
 
-                [encoder encodeObject:[NSNumber numberWithUnsignedInteger:self.state] forKey:@"state"];
+                if (self.state != MLSDownloadStateCompletion)
+                {
+                        [encoder encodeObject:[NSNumber numberWithUnsignedInteger:MLSDownloadStatePaused] forKey:@"state"];
+                }
+                else
+                {
+                        [encoder encodeObject:[NSNumber numberWithUnsignedInteger:MLSDownloadStateCompletion] forKey:@"state"];
+                }
 
                 [encoder encodeDouble:self.fileSize forKey:@"fileSize"];
                 [encoder encodeObject:[self key] forKey:@"key"];
@@ -430,7 +410,7 @@ NSRecursiveLock *recursiveLock()
 
                 @synchronized (self)
                 {
-                        [self setCustomData:[decoder decodeObjectForKey:@"customData"]];
+                        [self setCustomParaData:[decoder decodeObjectForKey:@"customParaData"]];
                         [self setLocalFullPath:[decoder decodeObjectForKey:@"localFullPath"]];
                         [self setFileType:[decoder decodeObjectForKey:@"fileType"]];
 
@@ -447,31 +427,40 @@ NSRecursiveLock *recursiveLock()
                         [self setSaveFileName:[decoder decodeObjectForKey:@"saveFileName"]];
 
                         self.canAutoResume = [decoder decodeBoolForKey:@"canAutoResume"];
-
-#pragma mark - 兼容上个版本
-                        self.completion = [decoder decodeBoolForKey:@"completion"];
-                        self.suspend = [decoder decodeBoolForKey:@"suspend"];
-                        self.downloading = [decoder decodeBoolForKey:@"downloading"];
-                        self.waiting = [decoder decodeBoolForKey:@"waiting"];
                 }
 
         }
         return self;
 }
+- (id)copy
+{
+        MLSDownloadOperation * theCopy = [[[self class] alloc] initWithUrlStr:self.urlStr fileName:self.fileName fileSize:self.fileSize fileDestinationPath:self.filePath placeHolder:self.placeHolderImageUrl progress:self.progressCallBackBlock completion:self.completionCallBackBlock];
+        theCopy.completionPercent = self.completionPercent;
+        theCopy.canAutoResume = self.isCanAutoResume;
+        theCopy.key = self.key;
+
+        NSData *customData = [NSKeyedArchiver archivedDataWithRootObject:self.customParaData];
+
+        if (customData)
+        {
+                theCopy.customParaData = [NSKeyedUnarchiver unarchiveObjectWithData:customData];
+        }
+
+        return theCopy;
+
+}
 - (id)copyWithZone:(NSZone *)zone
 {
-        MLSDownloadOperation * theCopy = nil;
+        MLSDownloadOperation * theCopy = [[[self class] allocWithZone:zone] initWithUrlStr:self.urlStr fileName:self.fileName fileSize:self.fileSize fileDestinationPath:self.filePath placeHolder:self.placeHolderImageUrl progress:self.progressCallBackBlock completion:self.completionCallBackBlock];
+        theCopy.completionPercent = self.completionPercent;
+        theCopy.canAutoResume = self.isCanAutoResume;
+        theCopy.key = self.key;
 
-        NSData *data = [NSKeyedArchiver archivedDataWithRootObject:self];
+        NSData *customData = [NSKeyedArchiver archivedDataWithRootObject:self.customParaData];
 
-        if (data)
+        if (customData)
         {
-                theCopy = [NSKeyedUnarchiver unarchiveObjectWithData:data];
-                theCopy.localFullPath = self.localFullPath;
-                theCopy.filePath = self.filePath;
-                theCopy.progressCallBackBlock = self.progressCallBackBlock;
-                theCopy.completionCallBackBlock = self.completionCallBackBlock;
-                theCopy.networkSpeedCallBackBlock = self.networkSpeedCallBackBlock;
+                theCopy.customParaData = [NSKeyedUnarchiver unarchiveObjectWithData:customData];
         }
         
         return theCopy;
@@ -485,8 +474,6 @@ NSRecursiveLock *recursiveLock()
         if (data)
         {
                 theCopy = [NSKeyedUnarchiver unarchiveObjectWithData:data];
-                theCopy.localFullPath = self.localFullPath;
-                theCopy.filePath = self.filePath;
                 theCopy.progressCallBackBlock = self.progressCallBackBlock;
                 theCopy.completionCallBackBlock = self.completionCallBackBlock;
                 theCopy.networkSpeedCallBackBlock = self.networkSpeedCallBackBlock;

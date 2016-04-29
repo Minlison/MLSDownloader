@@ -18,7 +18,7 @@
 
 @interface MLSDownloader : NSObject <NSCoding>
 
-@property (strong, nonatomic) NSArray <MLSDownloadOperation *>*downloadingArray;
+@property (strong, nonatomic) NSMutableArray <MLSDownloadOperation *>*downloadingArray;
 @property (strong, nonatomic) NSMutableDictionary <NSString *, MLSDownloadOperation *> *downloadingInfo;
 
 /**
@@ -140,3 +140,5 @@
 
 
 @end
+
+FOUNDATION_EXTERN NSString *MLSDownloadRefreshDataNotifaction;

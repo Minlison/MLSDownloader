@@ -15,7 +15,7 @@ typedef NS_OPTIONS(NSInteger, TotalDiskSpaceType)
     TotalDiskSpaceTypeMB = 1,
     TotalDiskSpaceTypeGB = 2,
 };
-@interface MLSDownloadFileTools : NSObject
+@interface MLSDownloadFileTools  : NSObject
 
 // 剩余磁盘空间(字节单位)
 + (unsigned long long)getTotalDiskSpaceInBytes;

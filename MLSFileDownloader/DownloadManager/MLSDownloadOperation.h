@@ -66,7 +66,7 @@ typedef NS_OPTIONS(NSUInteger, MLSDownloadState)
 /**
  *  自定义参数，会原封不动的传回
  */
-@property (strong, nonatomic) id <NSCoding> customData;
+@property (strong, nonatomic) id <NSCoding> customParaData;
 /**
  *  是否允许网络良好的情况下，自动继续, 默认为NO
  */
@@ -136,17 +136,6 @@ typedef NS_OPTIONS(NSUInteger, MLSDownloadState)
 @property (copy, nonatomic, readonly) NSString *key;
 
 
-// 完成
-@property (assign, nonatomic) BOOL completion NS_DEPRECATED_IOS(1_0,1_0,"请使用方法isCompletion");
-// 暂停
-@property (assign, nonatomic, getter=isSuspend) BOOL suspend NS_DEPRECATED_IOS(1_0,1_0,"请使用方法isPaused");
-// 下载
-@property (assign, nonatomic, getter=isDownloading) BOOL downloading NS_DEPRECATED_IOS(1_0,1_0,"请使用方法isExecuting");
-// 等待中
-@property ( assign, nonatomic, getter=isWaiting ) BOOL waiting NS_DEPRECATED_IOS(1_0,1_0,"请使用方法isReady");
-
-@property ( assign, nonatomic, getter=isWritingFile ) BOOL writingFile NS_DEPRECATED_IOS(1_0,1_0,"unUsed");
-
 
 /**
  *  初始化下载操作 --> 子类实现
@@ -186,8 +175,8 @@ typedef NS_OPTIONS(NSUInteger, MLSDownloadState)
 - (BOOL)deleteFile;
 
 - (BOOL)changeUrlString:(NSString *)urlString;
-// 计算网速 --> 子类实现
-- (void)countNetworkSpeed;
+
+
 // 完成回调
 @property (copy, nonatomic, readonly) MLSDownloaderCompletionCallBackBlock completionCallBackBlock;
 

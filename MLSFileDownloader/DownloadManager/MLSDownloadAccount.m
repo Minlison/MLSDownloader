@@ -8,6 +8,7 @@
 
 #import "MLSDownloadAccount.h"
 #import "MLSDownloader.h"
+#import "MLSDownloadFileTools.h"
 
 #define NEW_DirectoryPathString @".com.downloader.downloadState"
 #define OLD_DirectoryPathString @"com.downloader.downloadState"
@@ -86,8 +87,14 @@
         {
                 [downloadingInfo setValuesForKeysWithDictionary:new_downloader.downloadingInfo];
         }
+    
+        [downloadingInfo enumerateKeysAndObjectsUsingBlock:^(id  _Nonnull key, MLSDownloadOperation *  _Nonnull obj, BOOL * _Nonnull stop) {
+            [obj changeFileRootPathWithPath:[MLSDownloadFileTools saveFilePath]];
+        }];
 
-        [MLSDownloaderSingleton setValue:downloadingInfo forKey:@"downloadingInfo"];
+        MLSDownloaderSingleton.downloadingInfo = downloadingInfo;
+        [MLSDownloaderSingleton.downloadingArray removeAllObjects];
+        [MLSDownloaderSingleton.downloadingArray addObjectsFromArray:downloadingInfo.allValues];
 
 
         [self saveDownloadState];

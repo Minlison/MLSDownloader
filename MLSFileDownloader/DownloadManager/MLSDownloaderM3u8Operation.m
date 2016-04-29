@@ -51,13 +51,13 @@ size_t m3u8downLoadPackage(char *downloadData, size_t size, size_t count, void* 
 }
 - (id)copyWithZone:(NSZone *)zone
 {
-        MLSDownloaderM3u8SegmentInfo * theCopy = nil;
+        MLSDownloaderM3u8SegmentInfo * theCopy = [[[self class] allocWithZone:zone] init];
 
-        NSData *data = [NSKeyedArchiver archivedDataWithRootObject:self];
-
-        if (data)
+        if (theCopy)
         {
-                theCopy = [NSKeyedUnarchiver unarchiveObjectWithData:data];
+                theCopy.index = self.index;
+                theCopy.duration = self.duration;
+                theCopy.url = self.url.copy;
         }
 
         return theCopy;
@@ -88,7 +88,10 @@ size_t m3u8downLoadPackage(char *downloadData, size_t size, size_t count, void* 
 {
         char ts_downlad_flag;
 }
-
+/**
+ *  记录当前正在使用的curl
+ */
+@property (assign, nonatomic) CURL *curl;
 /**
  *  ts文件信息
  */
@@ -114,23 +117,11 @@ size_t m3u8downLoadPackage(char *downloadData, size_t size, size_t count, void* 
 
 // 判断是cancel还是libcurl错误
 @property (assign, nonatomic,getter=isCurlError) BOOL curlError;
+
 @end
 @implementation MLSDownloaderM3u8Operation
 
 
-// 计算网速
-- (void)countNetworkSpeed
-{
-        NSLog(@"%@计算网速",self.fileName);
-        dispatch_async(dispatch_get_main_queue(), ^{
-
-                if (self.networkSpeedCallBackBlock != nil)
-                {
-                        self.networkSpeedCallBackBlock(self.downloadLength);
-                        self.downloadLength = 0;
-                }
-        });
-}
 
 - (NSString *)locaPlayUrlStr {
 
@@ -166,6 +157,7 @@ size_t m3u8downLoadPackage(char *downloadData, size_t size, size_t count, void* 
                 if ( [self analyseVideoUrl:self.urlStr] )
                 {
                         self.curlError = NO;
+
                         if (self.isCancelled)
                         {
                                 return;
@@ -188,7 +180,9 @@ size_t m3u8downLoadPackage(char *downloadData, size_t size, size_t count, void* 
                                         ts_downlad_flag = 0;
                                         return;
                                 }
+                                [recursiveLock() lock];
                                 [self createLocalM3U8File];
+                                [recursiveLock() unlock];
                                 
                                 while ( self.state == MLSDownloadStateExecuting )
                                 {
@@ -198,10 +192,12 @@ size_t m3u8downLoadPackage(char *downloadData, size_t size, size_t count, void* 
                         else
                         {
                                 [recursiveLock() lock];
+
                                 [self cancel];
                                 self.state = MLSDownloadStateCompletion;
-                                [recursiveLock() unlock];
                                 [self createLocalM3U8File];
+
+                                [recursiveLock() unlock];
 
                                 dispatch_sync(dispatch_get_main_queue(), ^{
 
@@ -216,7 +212,9 @@ size_t m3u8downLoadPackage(char *downloadData, size_t size, size_t count, void* 
                 }
                 else
                 {
+                        [recursiveLock() lock];
                         self.state = MLSDownloadStatePaused;
+                        [recursiveLock() unlock];
                 }
 
                 ts_downlad_flag = 0;
@@ -387,7 +385,7 @@ size_t m3u8downLoadPackage(char *downloadData, size_t size, size_t count, void* 
         else if( self.segmentInfoList && self.segmentInfoList.count == self.totalTsCount )
         {
                 NSString *fullPath = nil;
-                if (self.state == MLSDownloadStateCompletion)
+                if ( self.state == MLSDownloadStateCompletion )
                 {
                         fullPath = tempFilePath;
                 }
@@ -497,9 +495,13 @@ size_t m3u8downLoadPackage(char *downloadData, size_t size, size_t count, void* 
 
         const char *url = [urlString cStringUsingEncoding:NSUTF8StringEncoding];
 
+
+
         CURL* curl;
-        CURLcode res;
+        CURLcode res = CURL_LAST;
         int responseCode = 0;
+
+
 
         curl = curl_easy_init();
         curl_easy_setopt(curl, CURLOPT_URL, url);
@@ -510,29 +512,65 @@ size_t m3u8downLoadPackage(char *downloadData, size_t size, size_t count, void* 
         curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
         curl_easy_setopt(curl, CURLOPT_USERAGENT,"User-Agent:Mozilla/5.0 (Macintosh; U; Intel Mac OS X 10_6_8; en-us) AppleWebKit/534.50 (KHTML, like Gecko) Version/5.1 Safari/534.50");
 
-        res = curl_easy_perform(curl);
+        if (self.isCancelled)
+        {
+                [recursiveLock() lock];
+                curl_easy_cleanup(curl);
+                [recursiveLock() unlock];
+
+                return NO;
+        }
 
         [recursiveLock() lock];
-
-        res = curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &responseCode);
-
+        self.curl = curl;
         [recursiveLock() unlock];
+
+        if (self.curl && !self.isCancelled && !self.isPaused)
+        {
+                res = curl_easy_perform(curl);
+        }
+
+
+
+        [recursiveLock() lock];
+        if (self.curl)
+        {
+                res = curl_easy_getinfo(self.curl, CURLINFO_RESPONSE_CODE, &responseCode);
+        }
+        [recursiveLock() unlock];
+
         
-        curl_easy_cleanup(curl);
+        [recursiveLock() lock];
+        if (self.curl)
+        {
+                curl_easy_cleanup(self.curl);
+                self.curl = NULL;
+        }
+        [recursiveLock() unlock];
+
+        if (self.isCancelled)
+        {
+                return NO;
+        }
 
         // 说明文件不存在
-        if ( responseCode >= 400 )
+        if ( responseCode >= 400 || res!= CURLE_OK )
         {
-                self.curlError = NO;
+                NSString *errorReson = @"网络文件不存在";
+
+                NSError *error = [NSError errorWithDomain:errorDomain code:DownloadOperationErrorCodeFileIsNotExit userInfo:@{NSLocalizedDescriptionKey : errorReson}];
+
+                dispatch_async(dispatch_get_main_queue(), ^{
+                        if (self.completionCallBackBlock != nil)
+                        {
+                                self.completionCallBackBlock(self,nil,error);
+                        }
+                });
+
                 return NO;
         }
 
-        if( res != CURLE_OK )
-        {
-                fprintf(stderr, "checkNetworkFileIsExit failed: %s\n", curl_easy_strerror(res));
-                NSLog(@"checkNetworkFileIsExit error");
-                return NO;
-        }
+
         
 
         
@@ -553,6 +591,14 @@ size_t m3u8downLoadPackage(char *downloadData, size_t size, size_t count, void* 
                 if (segment == nil)
                 {
                         ts_downlad_flag &= (~_TS_Downloading_);
+
+                        [recursiveLock() lock];
+
+                        [self cancel];
+                        self.state = MLSDownloadStateCompletion;
+                        [self createLocalM3U8File];
+
+                        [recursiveLock() unlock];
 
                         dispatch_async(dispatch_get_main_queue(), ^{
                                 if (self.completionCallBackBlock != nil)
@@ -598,9 +644,9 @@ size_t m3u8downLoadPackage(char *downloadData, size_t size, size_t count, void* 
 
                 if (![self checkNetworkFileIsExit:segment.url] )
                 {
-                        [self cancel];
 
                         [recursiveLock() lock];
+                        [self cancel];
                         self.state = MLSDownloadStatePaused;
                         [recursiveLock() unlock];
 
@@ -630,7 +676,7 @@ size_t m3u8downLoadPackage(char *downloadData, size_t size, size_t count, void* 
                                 const char *packageUrl = [segment.url cStringUsingEncoding:NSUTF8StringEncoding];
 
                                 // Download pacakge
-                                CURLcode res;
+                                CURLcode res = CURL_LAST;
                                 CURL *curl = curl_easy_init();
 
                                 curl_easy_setopt(curl, CURLOPT_URL, packageUrl);
@@ -658,32 +704,65 @@ size_t m3u8downLoadPackage(char *downloadData, size_t size, size_t count, void* 
 
                                 curl_easy_setopt(curl, CURLOPT_USERAGENT,"User-Agent:Mozilla/5.0 (Macintosh; U; Intel Mac OS X 10_6_8; en-us) AppleWebKit/534.50 (KHTML, like Gecko) Version/5.1 Safari/534.50");
 
-                                res = curl_easy_perform(curl);
+                                [recursiveLock() lock];
+                                self.curl = curl;
+                                [recursiveLock() unlock];
 
-                                curl_easy_cleanup(curl);
+                                if (self.isCancelled)
+                                {
+                                        [recursiveLock() lock];
+                                        if (self.curl)
+                                        {
+                                                curl_easy_cleanup(self.curl);
+                                                self.curl = NULL;
+                                                curl = NULL;
+                                        }
+                                        [recursiveLock() unlock];
+                                        return;
+                                }
+
+                                if (self.curl && !self.isCancelled && !self.isPaused)
+                                {
+                                        res = curl_easy_perform(curl);
+                                }
+
+                                
+                                [recursiveLock() lock];
+
+                                if (self.curl)
+                                {
+                                        curl_easy_cleanup(self.curl);
+                                        self.curl = NULL;
+                                        curl = NULL;
+                                }
+                                
+                                [recursiveLock() unlock];
 
                                 // CURLE_WRITE_ERROR  // 调用pause方法取消下载
                                 // CURLE_OK  正常下载完
                                 // CURLE_COULDNT_CONNECT  无网络连接
                                 // CURLE_OPERATION_TIMEDOUT  正在下载中，断掉网络
                                 // CURLE_RANGE_ERROR  传入的range不对
-
+                                [recursiveLock() lock];
                                 if ( self.fp != NULL )
                                 {
                                         fclose(self.fp);
                                         self.fp = NULL;
                                 }
+                                [recursiveLock() unlock];
 
                                 curl = NULL;
 
                                 if (res == CURLE_OK)
                                 {
+                                        [recursiveLock() lock];
                                         rename(tempPath, realPath);
                                         self.currentDownloadTsIndex++;
                                         if (self.waitingDownloadArray.count > 0)
                                         {
                                                 [self.waitingDownloadArray removeObjectAtIndex:0];
                                         }
+                                        [recursiveLock() unlock];
                                         continue;
                                 }
                                 else
@@ -724,6 +803,14 @@ size_t m3u8downLoadPackage(char *downloadData, size_t size, size_t count, void* 
                         }
                         else
                         {
+                                [recursiveLock() lock];
+
+                                [self cancel];
+                                self.state = MLSDownloadStateCompletion;
+                                [self createLocalM3U8File];
+
+                                [recursiveLock() unlock];
+
                                 dispatch_async(dispatch_get_main_queue(), ^{
                                         if (self.completionCallBackBlock != nil)
                                         {
@@ -736,6 +823,14 @@ size_t m3u8downLoadPackage(char *downloadData, size_t size, size_t count, void* 
                 }
                 else
                 {
+                        [recursiveLock() lock];
+
+                        [self cancel];
+                        self.state = MLSDownloadStateCompletion;
+                        [self createLocalM3U8File];
+
+                        [recursiveLock() unlock];
+
                         dispatch_async(dispatch_get_main_queue(), ^{
                                 if (self.completionCallBackBlock != nil)
                                 {
@@ -755,13 +850,10 @@ size_t m3u8downLoadPackage(char *downloadData, size_t size, size_t count, void* 
 
 - (id)copyWithZone:(NSZone *)zone
 {
-        MLSDownloaderM3u8Operation * theCopy = nil;
+        MLSDownloaderM3u8Operation * theCopy = [[[self class] allocWithZone:zone] init];
 
-        NSData *data = [NSKeyedArchiver archivedDataWithRootObject:self];
-
-        if (data)
+        if (theCopy)
         {
-                theCopy = [NSKeyedUnarchiver unarchiveObjectWithData:data];
                 theCopy.totalTsCount = self.totalTsCount;
                 theCopy.currentDownloadTsIndex = self.currentDownloadTsIndex;
                 theCopy.segmentInfoList = self.segmentInfoList.copy;
@@ -775,18 +867,16 @@ size_t m3u8downLoadPackage(char *downloadData, size_t size, size_t count, void* 
 - (id)mutableCopyWithZone:(NSZone *)zone
 {
         MLSDownloaderM3u8Operation * theCopy = nil;
-
         NSData *data = [NSKeyedArchiver archivedDataWithRootObject:self];
-
         if (data)
         {
                 theCopy = [NSKeyedUnarchiver unarchiveObjectWithData:data];
                 theCopy.totalTsCount = self.totalTsCount;
                 theCopy.currentDownloadTsIndex = self.currentDownloadTsIndex;
-                theCopy.segmentInfoList = self.segmentInfoList.copy;
-                theCopy.waitingDownloadArray = self.waitingDownloadArray.copy;
-                theCopy.header = self.header.copy;
-                theCopy.footer = self.footer.copy;
+                theCopy.segmentInfoList = self.segmentInfoList.mutableCopy;
+                theCopy.waitingDownloadArray = self.waitingDownloadArray.mutableCopy;
+                theCopy.header = self.header.mutableCopy;
+                theCopy.footer = self.footer.mutableCopy;
         }
         return theCopy;
 }
@@ -817,6 +907,15 @@ int m3u8ProgressFunc(void *ptr, double totalToDownload, double nowDownloaded, do
         if (operation.currentDownloadTsIndex >= operation.totalTsCount)
         {
                 operation.currentDownloadTsIndex = operation.totalTsCount;
+        }
+
+        double speed = 0;
+        if (curl_easy_getinfo(operation.curl, CURLINFO_SPEED_DOWNLOAD,&speed) == CURLE_OK)
+        {
+                if ( operation.networkSpeedCallBackBlock != nil )
+                {
+                        operation.networkSpeedCallBackBlock(speed);
+                }
         }
         
         CGFloat percent = operation.currentDownloadTsIndex * onePercent + ( nowDownloaded * 1.0 / totalToDownload ) * onePercent;
